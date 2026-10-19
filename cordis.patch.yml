@@ -1,0 +1,11 @@
+# MIND for DSH bundle layer.
+# When installed via `dsh plugin add`, the loader resolves `mind-dsh`
+# from the profile's node_modules.
+- insert:
+    - id: mind-dsh
+      name: mind-dsh
+      config:
+        # Capture is on by default; injection is on; UI is enabled.
+        captureEnabled: true
+        injectEnabled: true
+        uiEnabled: true
