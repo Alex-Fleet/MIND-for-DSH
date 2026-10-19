@@ -395,6 +395,16 @@ export class Store {
       .all(workspaceId, `${month}%`) as Array<Record<string, unknown>>
   }
 
+  listRecentDays(workspaceId: string, beforeDate: string, limit: number): Array<Record<string, unknown>> {
+    return this.db
+      .prepare(
+        `SELECT * FROM day_index
+         WHERE workspace_id = ? AND local_date < ?
+         ORDER BY local_date DESC LIMIT ?`,
+      )
+      .all(workspaceId, beforeDate, limit) as Array<Record<string, unknown>>
+  }
+
   listDaysInRange(workspaceId: string, startDate: string, endDate: string): Array<Record<string, unknown>> {
     return this.db
       .prepare(

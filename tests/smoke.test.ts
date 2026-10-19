@@ -6,7 +6,7 @@ import { apply, inject, name } from '../src/index.js'
 
 function fakeContext() {
   const sections: Array<{ name: string; order: number; text: unknown }> = []
-  const listeners: Array<(...args: unknown[]) => void> = []
+  const listeners: Array<{ event: string; listener: (...args: unknown[]) => void }> = []
   const cleanups: Array<() => void> = []
   const ctx = {
     systemPrompt: {
@@ -17,8 +17,8 @@ function fakeContext() {
       context: () => () => {},
       getSectionOrder: () => 1000,
     },
-    on: (_event: string, listener: (...args: unknown[]) => void) => {
-      listeners.push(listener)
+    on: (event: string, listener: (...args: unknown[]) => void) => {
+      listeners.push({ event, listener })
       return () => {}
     },
     effect: (factory: () => () => void) => {
@@ -42,7 +42,8 @@ describe('plugin skeleton', () => {
 
     expect(sections).toHaveLength(1)
     expect(sections[0]?.name).toBe('mind-dsh:static')
-    expect(listeners).toHaveLength(1)
+    expect(listeners).toHaveLength(2)
+    expect(listeners.map(entry => entry.event)).toEqual(['session/event', 'agent/pre-step'])
     expect(cleanups).toHaveLength(1)
 
     cleanups[0]?.()

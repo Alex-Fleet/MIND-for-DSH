@@ -4,6 +4,8 @@ declare module '@deepseek-ai/cordis' {
   interface Events {
     /** Session event stream (DSH core). Payload shapes are narrowed at the call site. */
     'session/event': (session: unknown, event: unknown) => void
+    /** Per-step waterfall: the last chance to enter or reject the step's user messages. */
+    'agent/pre-step': (payload: unknown, next: () => Promise<unknown>) => Promise<unknown>
   }
 }
 

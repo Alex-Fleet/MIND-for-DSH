@@ -15,6 +15,13 @@ export interface MindConfig {
   leaseMs?: number
   /** Hard-wrap width for model-readable turn files. */
   wrapWidth?: number
+  /** Directory containing behavior-standards.md, programming-standards.md, checklists-index.md. */
+  standardsDir?: string
+  /** Local day boundary in minutes after midnight (default 240 = 04:00). */
+  dayBoundaryMinutes?: number
+  /** Auxiliary summary provider/model; defaults to the turn's request model. */
+  summaryProvider?: string
+  summaryModel?: string
 }
 
 export type ResolvedConfig = Required<MindConfig>
@@ -28,6 +35,10 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   maxAttempts: 5,
   leaseMs: 60_000,
   wrapWidth: 800,
+  standardsDir: '',
+  dayBoundaryMinutes: 240,
+  summaryProvider: '',
+  summaryModel: '',
 }
 
 export function resolveMindRoot(config: MindConfig = {}): string {
@@ -39,9 +50,14 @@ export function resolveMindRoot(config: MindConfig = {}): string {
 }
 
 export function resolveConfig(config: MindConfig = {}): ResolvedConfig {
+  const mindRoot = resolveMindRoot(config)
   return {
     ...DEFAULT_CONFIG,
     ...config,
-    mindRoot: resolveMindRoot(config),
+    mindRoot,
+    standardsDir:
+      config.standardsDir !== undefined && config.standardsDir !== ''
+        ? path.resolve(config.standardsDir)
+        : path.join(mindRoot, 'global', 'standards'),
   }
 }
