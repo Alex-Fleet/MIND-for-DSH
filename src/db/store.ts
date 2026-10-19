@@ -520,6 +520,61 @@ export class Store {
       .all(status) as Array<Record<string, unknown>>
   }
 
+  findActiveLocation(volumeUuid: string | null, inode: number | null): Record<string, unknown> | undefined {
+    if (volumeUuid === null || inode === null) return undefined
+    return this.db
+      .prepare("SELECT * FROM workspace_location WHERE volume_uuid = ? AND inode = ? AND status = 'active'")
+      .get(volumeUuid, inode) as Record<string, unknown> | undefined
+  }
+
+  getLocation(locationId: string): Record<string, unknown> | undefined {
+    return this.db.prepare('SELECT * FROM workspace_location WHERE location_id = ?').get(locationId) as
+      | Record<string, unknown>
+      | undefined
+  }
+
+  listLocations(workspaceId: string): Array<Record<string, unknown>> {
+    return this.db
+      .prepare("SELECT * FROM workspace_location WHERE workspace_id = ? AND status = 'active'")
+      .all(workspaceId) as Array<Record<string, unknown>>
+  }
+
+  updateLocationPath(locationId: string, currentPath: string): void {
+    this.db
+      .prepare('UPDATE workspace_location SET current_path = ?, last_seen = ? WHERE location_id = ?')
+      .run(currentPath, nowIso(), locationId)
+  }
+
+  retireLocation(locationId: string): void {
+    this.db
+      .prepare("UPDATE workspace_location SET status = 'retired', retired_at = ? WHERE location_id = ?")
+      .run(nowIso(), locationId)
+  }
+
+  findWorkspaceByMarker(markerId: string): Record<string, unknown> | undefined {
+    return this.db.prepare('SELECT * FROM workspace_identity WHERE marker_id = ?').get(markerId) as
+      | Record<string, unknown>
+      | undefined
+  }
+
+  findWorkspaceByGit(gitRemote: string | null, gitRootCommit: string | null): Record<string, unknown> | undefined {
+    if (gitRemote === null && gitRootCommit === null) return undefined
+    return this.db
+      .prepare(
+        `SELECT * FROM workspace_identity
+         WHERE (? IS NOT NULL AND git_remote = ?)
+            OR (? IS NOT NULL AND git_root_commit = ?)
+         LIMIT 1`,
+      )
+      .get(gitRemote, gitRemote, gitRootCommit, gitRootCommit) as Record<string, unknown> | undefined
+  }
+
+  getWorkspaceIdentity(workspaceId: string): Record<string, unknown> | undefined {
+    return this.db.prepare('SELECT * FROM workspace_identity WHERE workspace_id = ?').get(workspaceId) as
+      | Record<string, unknown>
+      | undefined
+  }
+
   countTurns(): number {
     return Number((this.db.prepare('SELECT COUNT(*) AS c FROM turns').get() as { c: number }).c)
   }

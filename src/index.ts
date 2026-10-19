@@ -7,6 +7,7 @@ import { TurnBuffer, type EventLike, type SessionLike } from './capture/buffer.j
 import { CaptureWorker, localDateOf } from './capture/worker.js'
 import { resolveConfig, type MindConfig } from './config.js'
 import { Store } from './db/store.js'
+import { resolveWorkspace } from './identity/workspace.js'
 import { buildIncrement } from './inject/increment.js'
 import { buildSnapshot } from './inject/snapshot.js'
 import { createStandardsProvider } from './inject/standards.js'
@@ -67,7 +68,25 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
 
   let currentWorkspaceId: string | null = null
   let currentWorkspacePath: string | null = null
+  let currentCwd: string | null = null
   const lastIncrement = new Map<string, string>()
+
+  function ensureWorkspace(cwd: string | null): string | null {
+    if (cwd === null || cwd === '') return currentWorkspaceId
+    if (cwd === currentCwd) return currentWorkspaceId
+    currentCwd = cwd
+    try {
+      const resolved = resolveWorkspace(store, cwd)
+      currentWorkspaceId = resolved.workspaceId
+      currentWorkspacePath = resolved.workspacePath
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      console.warn(`[mind-dsh] workspace resolve failed: ${message}`)
+      currentWorkspaceId = workspaceIdFor(cwd)
+      currentWorkspacePath = cwd
+    }
+    return currentWorkspaceId
+  }
 
   const c = ctx as MindContext
   const standards = createStandardsProvider(config.standardsDir)
@@ -92,13 +111,12 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
 
   ctx.on('session/event', (sessionRaw: unknown, eventRaw: unknown) => {
     const session = sessionRaw as SessionLike
-    currentWorkspacePath = session.header?.cwd ?? currentWorkspacePath
-    currentWorkspaceId = workspaceIdFor(currentWorkspacePath)
+    const workspaceId = ensureWorkspace(session.header?.cwd ?? null)
     if (!config.captureEnabled) return
     const finished = buffer.push(session, eventRaw as EventLike)
     if (finished === null) return
     worker.enqueue(finished, {
-      workspaceId: workspaceIdFor(finished.workspacePath),
+      workspaceId: workspaceId ?? workspaceIdFor(finished.workspacePath),
       rootId: ROOT_ID,
     })
   })
@@ -110,7 +128,7 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
     const input = payload as PreStepPayload
     if (input.step !== 1) return downstream
 
-    const workspaceId = workspaceIdFor(input.agent?.session?.header?.cwd ?? currentWorkspacePath)
+    const workspaceId = ensureWorkspace(input.agent?.session?.header?.cwd ?? null) ?? currentWorkspaceId
     if (workspaceId === null) return downstream
 
     const increment = buildIncrement(store, workspaceId, localDateOf(Date.now(), config.dayBoundaryMinutes))
