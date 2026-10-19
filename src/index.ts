@@ -7,7 +7,10 @@ import { TurnBuffer, type EventLike, type SessionLike } from './capture/buffer.j
 import { CaptureWorker, localDateOf } from './capture/worker.js'
 import { loadPersistedSettings, resolveConfig, savePersistedSettings, type MindConfig } from './config.js'
 import { Store } from './db/store.js'
+import { workspacePathCandidates } from './identity/path.js'
+import { SessionWorkspaceCache } from './identity/session-cache.js'
 import { resolveWorkspace } from './identity/workspace.js'
+import { hardenDirectoryTree } from './security/permissions.js'
 import { findOpenTurn } from './recovery/open-turn.js'
 import { buildIncrement } from './inject/increment.js'
 import { buildSnapshot } from './inject/snapshot.js'
@@ -44,10 +47,34 @@ type PreStepDecision =
 export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
   const config = resolveConfig(rawConfig)
   fs.mkdirSync(config.mindRoot, { recursive: true, mode: 0o700 })
+  // A custom mindRoot could point at a shared directory. Only harden roots
+  // that are new/empty, explicitly marked, or the conventional `.../mind`
+  // directory with an existing database.
+  const rootMarker = path.join(config.mindRoot, '.mind-root')
+  let rootEntries: string[] = []
   try {
-    fs.chmodSync(config.mindRoot, 0o700)
+    rootEntries = fs.readdirSync(config.mindRoot)
   } catch {
-    // A read-only or exotic filesystem may refuse chmod; do not block capture.
+    // Treat an unreadable root as unsafe to harden.
+  }
+  const safeRoot =
+    rootEntries.length === 0 ||
+    fs.existsSync(rootMarker) ||
+    (path.basename(config.mindRoot) === 'mind' && fs.existsSync(path.join(config.mindRoot, 'mind.db')))
+  if (safeRoot) {
+    try {
+      if (!fs.existsSync(rootMarker)) {
+        fs.writeFileSync(rootMarker, 'mind\n', { encoding: 'utf8', mode: 0o600 })
+      }
+      fs.chmodSync(config.mindRoot, 0o700)
+      hardenDirectoryTree(config.mindRoot)
+    } catch {
+      // A read-only or exotic filesystem may refuse chmod; do not block capture.
+    }
+  } else {
+    console.warn(
+      `[mind-dsh] mindRoot is a non-empty directory without a MIND marker; skipping permission hardening: ${config.mindRoot}`,
+    )
   }
 
   // The Settings page owns two switches. Persisted values win over the
@@ -102,44 +129,20 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
   }, config.workerIntervalMs)
   interval.unref()
 
-  let currentWorkspaceId: string | null = null
-  let currentWorkspacePath: string | null = null
-  const workspaceBySession = new Map<string, { cwd: string; id: string | null; path: string | null }>()
-  const lastIncrement = new Map<string, string>()
-
-  /**
-   * Per-session cache: two sessions in different cwds must not resolve the
-   * workspace on every alternating event.
-   */
-  function ensureWorkspace(sessionId: string, cwd: string | null): string | null {
-    if (cwd === null || cwd === '') return currentWorkspaceId
-    const cached = workspaceBySession.get(sessionId)
-    if (cached !== undefined && cached.cwd === cwd) {
-      currentWorkspaceId = cached.id
-      currentWorkspacePath = cached.path
-      return cached.id
-    }
-    let id: string | null
-    let resolvedPath: string | null
+  const workspaces = new SessionWorkspaceCache(cwd => {
     try {
       const resolved = resolveWorkspace(store, cwd)
-      id = resolved.workspaceId
-      resolvedPath = resolved.workspacePath
+      return { id: resolved.workspaceId, path: resolved.workspacePath }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       console.warn(`[mind-dsh] workspace resolve failed: ${message}`)
-      id = workspaceIdFor(cwd)
-      resolvedPath = cwd
+      return { id: workspaceIdFor(cwd), path: cwd }
     }
-    workspaceBySession.set(sessionId, { cwd, id, path: resolvedPath })
-    while (workspaceBySession.size > 500) {
-      const oldest = workspaceBySession.keys().next().value
-      if (oldest === undefined) break
-      workspaceBySession.delete(oldest)
-    }
-    currentWorkspaceId = id
-    currentWorkspacePath = resolvedPath
-    return id
+  })
+  const lastIncrement = new Map<string, string>()
+
+  function ensureWorkspace(sessionId: string, cwd: string | null): string | null {
+    return workspaces.get(sessionId, cwd)
   }
 
   const c = ctx as MindContext
@@ -165,7 +168,7 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
       ).agent
       const sessionId = typeof agent?.id === 'string' ? agent.id : 'unknown'
       const cwd = agent?.session?.header?.cwd ?? null
-      const workspaceId = ensureWorkspace(sessionId, cwd) ?? currentWorkspaceId ?? 'orphan'
+      const workspaceId = ensureWorkspace(sessionId, cwd) ?? 'orphan'
       return buildSnapshot({
         store,
         workspaceId,
@@ -212,7 +215,7 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
       const finished = buffer.push(session, eventRaw as EventLike)
       if (finished === null) return
       worker.enqueue(finished, {
-        workspaceId: workspaceId ?? workspaceIdFor(finished.workspacePath),
+        workspaceId: workspaceId ?? 'orphan',
         rootId: ROOT_ID,
       })
     }) as never,
@@ -228,11 +231,10 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
       const input = payload as PreStepPayload
       if (input.step !== 1) return downstream
 
-      const workspaceId =
-        ensureWorkspace(
-          String(input.agent?.session?.id ?? 'unknown'),
-          input.agent?.session?.header?.cwd ?? null,
-        ) ?? currentWorkspaceId
+      const workspaceId = ensureWorkspace(
+        String(input.agent?.session?.id ?? 'unknown'),
+        input.agent?.session?.header?.cwd ?? null,
+      )
       if (workspaceId === null) return downstream
 
       const increment = buildIncrement(store, workspaceId, localDateOf(Date.now(), config.dayBoundaryMinutes))
@@ -256,7 +258,8 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
     clearInterval(interval)
     const remaining = buffer.flushAll()
     for (const turn of remaining) {
-      worker.enqueue(turn, { workspaceId: workspaceIdFor(turn.workspacePath), rootId: ROOT_ID })
+      const workspaceId = ensureWorkspace(turn.sessionId, turn.workspacePath) ?? 'orphan'
+      worker.enqueue(turn, { workspaceId, rootId: ROOT_ID })
     }
     void worker.flush().finally(() => {
       worker.dispose()
@@ -367,7 +370,15 @@ async function recoverInterruptedTurns(
       try {
         workspaceId = resolveWorkspace(store, cwd).workspaceId
       } catch {
-        workspaceId = workspaceIdFor(cwd)
+        // The directory may have been moved or deleted while the process was
+        // down. Reuse its recorded identity; a fresh path hash would split the
+        // same logical workspace in two. Try symlink/realpath variants too.
+        let historical: Record<string, unknown> | undefined
+        for (const candidate of workspacePathCandidates(cwd)) {
+          historical = store.findWorkspaceByPath(candidate)
+          if (historical !== undefined) break
+        }
+        workspaceId = historical === undefined ? 'orphan' : String(historical.workspace_id)
       }
     }
     worker.enqueue(

@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS workspace_path_history (
   PRIMARY KEY(workspace_id, path, first_seen)
 );
 
+CREATE INDEX IF NOT EXISTS idx_workspace_path_history_path
+  ON workspace_path_history(path, last_seen DESC);
+
 CREATE TABLE IF NOT EXISTS dsh_workspace_map (
   dsh_workspace_id TEXT PRIMARY KEY,
   mind_workspace_id TEXT NOT NULL,

@@ -54,7 +54,12 @@ export class Store {
 
   constructor(dbPath: string) {
     this.dbPath = dbPath
-    fs.mkdirSync(path.dirname(dbPath), { recursive: true })
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 })
+    try {
+      fs.chmodSync(path.dirname(dbPath), 0o700)
+    } catch {
+      // Filesystems without POSIX modes.
+    }
     this.db = new DatabaseSync(dbPath)
     this.db.exec('PRAGMA journal_mode = WAL')
     // FULL makes a committed turn survive a power loss, not just a process
@@ -63,6 +68,22 @@ export class Store {
     this.db.exec('PRAGMA busy_timeout = 5000')
     this.db.exec('PRAGMA foreign_keys = ON')
     this.migrate()
+    this.hardenFiles()
+  }
+
+  /**
+   * The root directory is 0700, but keep the database and its WAL/SHM
+   * companions 0600 as well. This is defense in depth for custom mind roots
+   * whose parent may be more permissive.
+   */
+  hardenFiles(): void {
+    for (const target of [this.dbPath, `${this.dbPath}-wal`, `${this.dbPath}-shm`]) {
+      try {
+        fs.chmodSync(target, 0o600)
+      } catch {
+        // Missing WAL/SHM or a filesystem without POSIX modes.
+      }
+    }
   }
 
   private migrate(): void {
@@ -75,6 +96,15 @@ export class Store {
     // build can stamp the current version while leaving a column missing.
     this.tx(() => {
       this.db.exec(SCHEMA_SQL)
+      // Older builds inserted one row per resolve because first_seen was part
+      // of the primary key. Collapse them before the path lookup starts
+      // relying on this table for recovery.
+      this.db.exec(
+        `DELETE FROM workspace_path_history
+         WHERE rowid NOT IN (SELECT MAX(rowid) FROM workspace_path_history GROUP BY workspace_id, path);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_path_unique
+           ON workspace_path_history(workspace_id, path);`,
+      )
       if (!this.hasColumn('cognition_entry', 'enabled')) {
         this.db.exec('ALTER TABLE cognition_entry ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1')
       }
@@ -100,6 +130,7 @@ export class Store {
   }
 
   close(): void {
+    this.hardenFiles()
     this.db.close()
   }
 
@@ -187,11 +218,13 @@ export class Store {
 
   recordPath(workspaceId: string, workspacePath: string): void {
     const now = nowIso()
+    // Keep one row per (workspace, path). The unique index created in
+    // migrate() makes this safe across concurrent writers.
     this.db
       .prepare(
         `INSERT INTO workspace_path_history(workspace_id, path, first_seen, last_seen)
          VALUES (?, ?, ?, ?)
-         ON CONFLICT(workspace_id, path, first_seen) DO UPDATE SET last_seen = excluded.last_seen`,
+         ON CONFLICT(workspace_id, path) DO UPDATE SET last_seen = excluded.last_seen`,
       )
       .run(workspaceId, workspacePath, now, now)
   }
@@ -244,11 +277,22 @@ export class Store {
            VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(turn_id) DO UPDATE SET
              end_reason = COALESCE(excluded.end_reason, turns.end_reason),
+             workspace_id = CASE
+               WHEN turns.workspace_id = 'orphan' AND excluded.workspace_id != 'orphan'
+               THEN excluded.workspace_id ELSE turns.workspace_id END,
+             local_date = CASE
+               WHEN turns.workspace_id = 'orphan' AND excluded.workspace_id != 'orphan'
+               THEN excluded.local_date ELSE turns.local_date END,
+             occurred_at = CASE
+               WHEN turns.workspace_id = 'orphan' AND excluded.workspace_id != 'orphan'
+               THEN excluded.occurred_at ELSE turns.occurred_at END,
              raw_rel_path = COALESCE(excluded.raw_rel_path, turns.raw_rel_path),
              raw_events_rel_path = COALESCE(excluded.raw_events_rel_path, turns.raw_events_rel_path),
              raw_chars = COALESCE(excluded.raw_chars, turns.raw_chars),
-             provider = COALESCE(excluded.provider, turns.provider),
-             model = COALESCE(excluded.model, turns.model)`,
+             -- A duplicate/late replay must not replace the model that was
+             -- actually used for an already-recorded turn.
+             provider = COALESCE(turns.provider, excluded.provider),
+             model = COALESCE(turns.model, excluded.model)`,
         )
         .run(
           turn.turnId,
@@ -331,18 +375,18 @@ export class Store {
   }
 
   /**
-   * Re-arm every retryable summary job at startup: legacy dead/failed rows,
-   * and healthy pending rows whose backoff would otherwise wait up to 30
-   * minutes. Only turns with a persisted provider/model are eligible, so this
-   * cannot loop on a turn whose model is genuinely unknown.
+   * Re-arm legacy dead/failed summary jobs at startup. Pending jobs keep
+   * their attempts and backoff: resetting them on every boot would turn a
+   * permanent failure into an immediate retry burst. Legacy turns may predate
+   * the provider/model columns, so they are included; the summarizer falls
+   * back to its configured/default model.
    */
   requeueSummaryFailures(now = nowIso()): number {
     const result = this.db
       .prepare(
         `UPDATE capture_job
          SET state = 'pending', attempts = 0, next_at = ?, owner = NULL, lease_until = NULL, last_error = NULL
-         WHERE state IN ('dead', 'failed', 'pending')
-           AND turn_id IN (SELECT turn_id FROM turns WHERE provider IS NOT NULL AND model IS NOT NULL)`,
+         WHERE state IN ('dead', 'failed')`,
       )
       .run(now)
     return Number(result.changes)
@@ -434,7 +478,8 @@ export class Store {
            status = excluded.status,
            source_rel_path = excluded.source_rel_path,
            root_id = excluded.root_id,
-           occurred_at = excluded.occurred_at`,
+           occurred_at = excluded.occurred_at
+         WHERE turn_index.status != 'current' OR excluded.status = 'current'`,
       )
       .run(
         input.turnId,
@@ -767,6 +812,25 @@ export class Store {
       .get(gitRemote, gitRemote, gitRootCommit, gitRootCommit) as Record<string, unknown> | undefined
   }
 
+  /**
+   * Last-resort identity lookup for a path that no longer exists on disk.
+   * Recovery must reuse the historical workspace instead of minting a
+   * path-hash "shadow" workspace.
+   */
+  findWorkspaceByPath(workspacePath: string): Record<string, unknown> | undefined {
+    if (workspacePath === '') return undefined
+    return this.db
+      .prepare(
+        `SELECT wi.*
+         FROM workspace_path_history h
+         JOIN workspace_identity wi ON wi.workspace_id = h.workspace_id
+         WHERE h.path = ?
+         ORDER BY h.last_seen DESC
+         LIMIT 1`,
+      )
+      .get(workspacePath) as Record<string, unknown> | undefined
+  }
+
   getWorkspaceIdentity(workspaceId: string): Record<string, unknown> | undefined {
     return this.db.prepare('SELECT * FROM workspace_identity WHERE workspace_id = ?').get(workspaceId) as
       | Record<string, unknown>
@@ -809,6 +873,22 @@ export class Store {
 
   getTurn(turnId: string): Record<string, unknown> | undefined {
     return this.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(turnId) as Record<string, unknown> | undefined
+  }
+
+  /**
+   * Most recent known model for a session. Used when a later turn has no
+   * `request/header` (DSH only records one on initial/resume/route changes).
+   */
+  findLastTurnModel(sessionId: string): { provider: string; model: string } | null {
+    const row = this.db
+      .prepare(
+        `SELECT provider, model FROM turns
+         WHERE session_id = ? AND provider IS NOT NULL AND model IS NOT NULL
+         ORDER BY occurred_at DESC, turn_seq DESC LIMIT 1`,
+      )
+      .get(sessionId) as { provider?: string; model?: string } | undefined
+    if (row?.provider === undefined || row.model === undefined) return null
+    return { provider: row.provider, model: row.model }
   }
 
   countTurnEvents(turnId: string): number {

@@ -192,4 +192,139 @@ describe('Store', () => {
     expect(store.getWatermark('missing')).toBeNull()
     store.close()
   })
+
+  it('does not downgrade a completed summary on a duplicate ingest', () => {
+    const store = tempStore()
+    const fallback = {
+      title: 'first line',
+      conclusion: '',
+      topics: [],
+      status: 'unsummarized' as const,
+      sourceRelPath: turn.rawRelPath,
+      rootId: 'default',
+      occurredAt: turn.occurredAt,
+    }
+    store.ingestTurn(turn, [], fallback)
+    store.upsertTurnIndex({
+      turnId: 's1:1',
+      title: 'LLM TITLE',
+      conclusion: 'LLM CONCLUSION',
+      topics: ['topic'],
+      status: 'current',
+      sourceRelPath: turn.rawRelPath,
+      rootId: 'default',
+      occurredAt: turn.occurredAt,
+    })
+
+    store.ingestTurn(turn, [], fallback)
+
+    const index = store.getTurnIndex('s1:1')
+    expect(index?.status).toBe('current')
+    expect(index?.title).toBe('LLM TITLE')
+    expect(index?.conclusion).toBe('LLM CONCLUSION')
+    store.close()
+  })
+
+  it('requeues legacy dead jobs even when provider/model are null', () => {
+    const store = tempStore()
+    store.insertTurnAndJob(turn, [])
+    const sqlite = (process as unknown as { getBuiltinModule(id: string): typeof import('node:sqlite') })
+      .getBuiltinModule('node:sqlite')
+    const db = new sqlite.DatabaseSync(store.dbPath)
+    db.exec("UPDATE capture_job SET state = 'dead'")
+    db.close()
+
+    expect(store.requeueSummaryFailures()).toBe(1)
+    expect(store.listJobs('dead')).toHaveLength(0)
+    expect(store.listJobs('pending')).toHaveLength(1)
+    store.close()
+  })
+
+  it('finds a workspace by its recorded historical path', () => {
+    const store = tempStore()
+    store.upsertWorkspaceIdentity({ workspaceId: 'ws-old', displayName: 'Old' })
+    store.recordPath('ws-old', '/moved/away')
+    expect(store.findWorkspaceByPath('/moved/away')?.workspace_id).toBe('ws-old')
+    expect(store.findWorkspaceByPath('/unknown')).toBeUndefined()
+    store.close()
+  })
+
+  it('keeps one path-history row per workspace and path', () => {
+    const store = tempStore()
+    store.upsertWorkspaceIdentity({ workspaceId: 'ws-old', displayName: 'Old' })
+    store.recordPath('ws-old', '/same/path')
+    store.recordPath('ws-old', '/same/path')
+    const sqlite = (process as unknown as { getBuiltinModule(id: string): typeof import('node:sqlite') })
+      .getBuiltinModule('node:sqlite')
+    const db = new sqlite.DatabaseSync(store.dbPath)
+    const row = db
+      .prepare('SELECT COUNT(*) AS c FROM workspace_path_history WHERE workspace_id = ? AND path = ?')
+      .get('ws-old', '/same/path') as { c: number }
+    db.close()
+    expect(row.c).toBe(1)
+    store.close()
+  })
+
+  it('returns the most recent known model for a session', () => {
+    const store = tempStore()
+    store.insertTurnAndJob(
+      { ...turn, turnId: 's1:1', turnSeq: 1, occurredAt: '2026-10-19T01:00:00.000Z', provider: 'p1', model: 'm1' },
+      [],
+    )
+    store.insertTurnAndJob(
+      { ...turn, turnId: 's1:2', turnSeq: 2, occurredAt: '2026-10-19T02:00:00.000Z', provider: 'p2', model: 'm2' },
+      [],
+    )
+    expect(store.findLastTurnModel('s1')).toEqual({ provider: 'p2', model: 'm2' })
+    expect(store.findLastTurnModel('missing')).toBeNull()
+    store.close()
+  })
+
+  it('keeps the original model on a duplicate ingest', () => {
+    const store = tempStore()
+    const index = {
+      title: 'hello',
+      conclusion: '',
+      topics: [],
+      status: 'unsummarized' as const,
+      sourceRelPath: turn.rawRelPath,
+      rootId: 'default',
+      occurredAt: turn.occurredAt,
+    }
+    store.ingestTurn({ ...turn, provider: 'p1', model: 'm1' }, [], index)
+    store.ingestTurn({ ...turn, provider: 'p2', model: 'm2' }, [], index)
+    expect(store.getTurn('s1:1')?.provider).toBe('p1')
+    expect(store.getTurn('s1:1')?.model).toBe('m1')
+    store.close()
+  })
+
+  it('corrects an orphan workspace on a later ingest', () => {
+    const store = tempStore()
+    const index = {
+      title: 'hello',
+      conclusion: '',
+      topics: [],
+      status: 'unsummarized' as const,
+      sourceRelPath: turn.rawRelPath,
+      rootId: 'default',
+      occurredAt: turn.occurredAt,
+    }
+    store.ingestTurn({ ...turn, workspaceId: 'orphan' }, [], index)
+    store.ingestTurn({ ...turn, workspaceId: 'ws-real' }, [], index)
+    expect(store.getTurn('s1:1')?.workspace_id).toBe('ws-real')
+    store.close()
+  })
+
+  it('keeps pending job attempts and backoff across a requeue', () => {
+    const store = tempStore()
+    store.insertTurnAndJob(turn, [])
+    const job = store.claimJob('owner', 60_000)!
+    store.failJob(job.id, 'boom', '2030-01-01T00:00:00.000Z')
+    const before = store.listJobs('pending')[0]
+    expect(store.requeueSummaryFailures()).toBe(0)
+    const after = store.listJobs('pending')[0]
+    expect(after?.attempts).toBe(before?.attempts)
+    expect(after?.next_at).toBe(before?.next_at)
+    store.close()
+  })
 })

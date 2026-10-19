@@ -174,8 +174,8 @@ export function isoWeek(localDate: string): { key: string; start: string; end: s
 }
 
 function writeAtomic(target: string, content: string): void {
-  fs.mkdirSync(path.dirname(target), { recursive: true })
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
   const temp = `${target}.tmp-${process.pid}-${Date.now()}`
-  fs.writeFileSync(temp, content, 'utf8')
+  fs.writeFileSync(temp, content, { encoding: 'utf8', mode: 0o600 })
   fs.renameSync(temp, target)
 }

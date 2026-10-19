@@ -28,17 +28,23 @@ export function registerMindTools(tools: ToolRegistry, store: Store, mindRoot: s
       parameters: {
         turn_id: { type: 'string', required: true, description: 'MIND turn id, e.g. session-...:1.' },
         offset_chars: { type: 'integer', description: 'Start character offset (default 0).' },
-        max_chars: { type: 'integer', description: 'Maximum characters to return (default 20000, max 100000).' },
+        max_chars: {
+          type: 'integer',
+          description:
+            'Maximum characters to return (default 20000, max 100000). A redaction marker may make one page slightly longer.',
+        },
       },
       output: TEXT_OUTPUT,
       timeoutMs: 15_000,
       execute: async args => {
         const input = args as { turn_id: string; offset_chars?: number; max_chars?: number }
-        const read = readTurnChunk(store, mindRoot, input.turn_id, input.offset_chars, input.max_chars)
+        // Redact while reading with an overlap window, so a credential that
+        // crosses a chunk boundary cannot be reassembled from two calls.
+        const read = readTurnChunk(store, mindRoot, input.turn_id, input.offset_chars, input.max_chars, {
+          redact: true,
+        })
         const nextLabel = read.next === null ? 'end' : String(read.next)
-        return redactSecrets(
-          `[turn ${read.turnId}] offset=${read.offset} total=${read.total} next=${nextLabel}\n\n${read.chunk}`,
-        )
+        return `[turn ${read.turnId}] offset=${read.offset} total=${read.total} next=${nextLabel}\n\n${read.chunk}`
       },
     }),
   )

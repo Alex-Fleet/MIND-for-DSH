@@ -27,10 +27,13 @@ export function buildSnapshot(options: SnapshotOptions): string {
   const maxChars = options.maxChars ?? 12_000
 
   const identity = store.getWorkspaceIdentity(workspaceId)
-  const displayName =
+  const displayNameRaw =
     typeof identity?.display_name === 'string' && identity.display_name.trim() !== ''
       ? identity.display_name.trim()
       : workspaceId
+  // Redact before clipping: clipping first can cut a credential in half and
+  // make it invisible to the pattern matcher.
+  const displayName = redactSecrets(displayNameRaw)
 
   const header = [
     '<mind_memory>',
@@ -45,22 +48,32 @@ export function buildSnapshot(options: SnapshotOptions): string {
     ...store.listCognitionEntries(workspaceId, 'user'),
   ]
     .slice(0, 30)
-    .map(entry => `- ${clip(String(entry.title ?? ''), 80)}: ${clip(String(entry.conclusion ?? ''), 240)}`)
+    .map(entry => {
+      const title = clip(redactSecrets(String(entry.title ?? '')), 80)
+      const conclusion = clip(redactSecrets(String(entry.conclusion ?? '')), 240)
+      return `- ${title}: ${conclusion}`
+    })
 
   const cognition = store
     .listCognitionEntries(workspaceId, 'project')
     .concat(store.listCognitionEntries(workspaceId, 'whiteboard'))
     .slice(0, maxCognition)
-    .map(entry => `- ${clip(String(entry.title ?? ''), 80)}: ${clip(String(entry.conclusion ?? ''), 240)}`)
+    .map(entry => {
+      const title = clip(redactSecrets(String(entry.title ?? '')), 80)
+      const conclusion = clip(redactSecrets(String(entry.conclusion ?? '')), 240)
+      return `- ${title}: ${conclusion}`
+    })
 
-  const axisRows = store.listRecentDays(workspaceId, localDate, days).reverse()
+  // Newest first: when the budget cuts the axis, the most recent days must
+  // survive. Display order is reversed below.
+  const axisRows = store.listRecentDays(workspaceId, localDate, days)
   const axis = axisRows.length === 0
     ? ['- (暂无)']
     : axisRows.map(day => {
         const date = String(day.local_date ?? '')
-        const title = clip(String(day.title ?? ''), 80)
+        const title = clip(redactSecrets(String(day.title ?? '')), 80)
         const count = Number(day.turn_count ?? 0)
-        const report = String(day.report_rel_path ?? '')
+        const report = redactSecrets(String(day.report_rel_path ?? ''))
         return `- ${date} · ${title} · ${count} turns${report === '' ? '' : ` · ${report}`}`
       })
 
@@ -72,13 +85,19 @@ export function buildSnapshot(options: SnapshotOptions): string {
 
   const base = [...header, '', dateLine, '', axisTitle, ''].join('\n') + `\n${closing}`
   const available = Math.max(0, maxChars - base.length)
-  const axisBudget = Math.floor(available * 0.4)
-  const rulesBudget = Math.floor(available * 0.35)
-  const cognitionBudget = Math.max(0, available - axisBudget - rulesBudget)
+  // The time axis is the only always-present historical index, so it gets
+  // first claim on the budget. Enrichment sections share only what remains;
+  // the axis is truncated only when it alone exceeds maxChars.
+  const fittedAxis = fitAxis(axis, available)
+  const axisBlock = fittedAxis.block
+  // If even the axis had to be cut, do not spend budget on enrichment: the
+  // recent-day index is more important than rules/cognition.
+  const remaining = fittedAxis.truncated ? 0 : Math.max(0, available - axisBlock.length - 8)
+  const rulesBudget = Math.floor(remaining * 0.5)
+  const cognitionBudget = Math.max(0, remaining - rulesBudget)
 
-  const axisBlock = fitBlock('', axis, axisBudget, true)
-  const rulesBlock = fitBlock('[硬约束 — 必须遵守]', rules, rulesBudget, false)
-  const cognitionBlock = fitBlock('[当前认知]', cognition, cognitionBudget, false)
+  const rulesBlock = fitBlock('[硬约束 — 必须遵守]', rules, rulesBudget)
+  const cognitionBlock = fitBlock('[当前认知]', cognition, cognitionBudget)
 
   const assemble = (withRules: boolean, withCognition: boolean, axisBlock: string): string =>
     [
@@ -106,26 +125,82 @@ export function buildSnapshot(options: SnapshotOptions): string {
 
   const minimalBase = [...header, '', dateLine, '', axisTitle, '', closing].join('\n')
   if (minimalBase.length > maxChars) {
-    const room = Math.max(0, maxChars - closing.length - 1)
-    return `${header.join('\n').slice(0, room)}\n${closing}`
+    return cap(`${header.join('\n')}\n${closing}`, maxChars, closing)
   }
-  const axisOnly = fitBlock('', axis, Math.max(0, maxChars - minimalBase.length), true)
-  return redactSecrets([...header, '', dateLine, '', axisTitle, axisOnly, closing].join('\n'))
+  const axisOnly = fitBlock('', axis, Math.max(0, maxChars - minimalBase.length))
+  return cap(
+    redactSecrets([...header, '', dateLine, '', axisTitle, axisOnly, closing].join('\n')),
+    maxChars,
+    closing,
+  )
 }
 
-function fitBlock(title: string, lines: string[], budget: number, keepHeading: boolean): string {
-  if (budget <= 0) return keepHeading ? `${title}\n- (预算不足)` : ''
-  if (lines.length === 0) return keepHeading ? `${title}\n- (暂无)` : ''
-  const kept: string[] = []
-  let used = title === '' ? 0 : title.length + 1
-  for (const line of lines) {
-    if (used + line.length + 1 > budget) break
-    kept.push(line)
-    used += line.length + 1
+function cap(text: string, maxChars: number, closing: string): string {
+  if (text.length <= maxChars) return text
+  if (maxChars <= closing.length) return closing.slice(0, maxChars)
+  return `${text.slice(0, maxChars - closing.length - 1)}\n${closing}`
+}
+
+/**
+ * Select the most recent days first, then reverse for chronological display.
+ * A truncation marker at the top means older days were omitted.
+ */
+function fitAxis(linesNewestFirst: string[], budget: number): { block: string; truncated: boolean } {
+  if (budget <= 0) return { block: '', truncated: true }
+  const marker = '- …（更早的日期已省略）'
+  const select = (limit: number): string[] => {
+    const kept: string[] = []
+    let used = 0
+    for (const line of linesNewestFirst) {
+      if (used + line.length + 1 > limit) break
+      kept.push(line)
+      used += line.length + 1
+    }
+    return kept
   }
-  if (kept.length === 0) return keepHeading ? `${title}\n- (预算不足)` : ''
-  const truncated = kept.length < lines.length ? '\n- …（已截断）' : ''
-  return title === '' ? kept.join('\n') + truncated : `${title}\n${kept.join('\n')}${truncated}`
+
+  let kept = select(budget)
+  if (kept.length < linesNewestFirst.length) {
+    kept = select(Math.max(0, budget - marker.length - 1))
+  }
+  if (kept.length === 0) {
+    return { block: budget >= marker.length ? marker : '', truncated: true }
+  }
+  const truncated = kept.length < linesNewestFirst.length
+  const display = [...kept].reverse()
+  return {
+    block: `${truncated ? `${marker}\n` : ''}${display.join('\n')}`,
+    truncated,
+  }
+}
+
+function fitBlock(title: string, lines: string[], budget: number): string {
+  if (budget <= 0) return ''
+  const heading = title === '' ? '' : `${title}\n`
+  if (lines.length === 0) {
+    const placeholder = `${heading}- (暂无)`
+    return placeholder.length <= budget ? placeholder : ''
+  }
+
+  const marker = '\n- …（已截断）'
+  const build = (limit: number): string[] => {
+    const kept: string[] = []
+    let used = heading.length
+    for (const line of lines) {
+      if (used + line.length + 1 > limit) break
+      kept.push(line)
+      used += line.length + 1
+    }
+    return kept
+  }
+
+  let kept = build(budget)
+  // Reserve the truncation marker inside the budget; otherwise a block at the
+  // exact limit can overshoot maxChars by the marker length.
+  if (kept.length < lines.length) kept = build(Math.max(0, budget - marker.length))
+  if (kept.length === 0) return ''
+  const truncated = kept.length < lines.length ? marker : ''
+  return `${heading}${kept.join('\n')}${truncated}`
 }
 
 function clip(value: string, max: number): string {

@@ -206,4 +206,209 @@ describe('CaptureWorker', () => {
     worker.dispose()
     store.close()
   })
+
+  it('uses the configured day boundary when choosing local_date', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mind-dsh-boundary-'))
+    cleanup.push(dir)
+    const config = resolveConfig({ mindRoot: dir, dayBoundaryMinutes: 0 })
+    const store = new Store(path.join(dir, 'mind.db'))
+    const worker = new CaptureWorker(store, config)
+    const buffer = new TurnBuffer()
+
+    buffer.push(session, { type: 'turn/start', time: Date.parse('2026-10-19T16:30:00Z'), data: { turn: 1 } })
+    buffer.push(session, {
+      type: 'user/message',
+      time: Date.parse('2026-10-19T16:30:01Z'),
+      data: { role: 'user', source: { kind: 'user' }, content: 'after midnight' },
+    })
+    const finished = buffer.push(session, {
+      type: 'turn/end',
+      time: Date.parse('2026-10-19T16:30:02Z'),
+      data: { turn: 1, reason: { kind: 'completed' } },
+    })!
+
+    worker.enqueue(finished, { workspaceId: 'ws1', rootId: 'default' })
+    await worker.flush()
+
+    expect(store.getTurn('session-1:1')?.local_date).toBe('2026-10-20')
+    worker.dispose()
+    store.close()
+  })
+
+  it('reuses the last request model for later turns without a header', async () => {
+    const { store, worker } = setup()
+    const buffer = new TurnBuffer()
+
+    buffer.push(session, { type: 'turn/start', time: Date.parse('2026-10-19T01:00:00Z'), data: { turn: 1 } })
+    buffer.push(session, {
+      type: 'request/header',
+      time: Date.parse('2026-10-19T01:00:01Z'),
+      data: { header: { config: { provider: 'provider-x', model: 'model-y' } } },
+    })
+    buffer.push(session, {
+      type: 'user/message',
+      time: Date.parse('2026-10-19T01:00:02Z'),
+      data: { role: 'user', source: { kind: 'user' }, content: 'first' },
+    })
+    const first = buffer.push(session, {
+      type: 'turn/end',
+      time: Date.parse('2026-10-19T01:00:03Z'),
+      data: { turn: 1, reason: { kind: 'completed' } },
+    })!
+
+    buffer.push(session, { type: 'turn/start', time: Date.parse('2026-10-19T01:01:00Z'), data: { turn: 2 } })
+    buffer.push(session, {
+      type: 'user/message',
+      time: Date.parse('2026-10-19T01:01:01Z'),
+      data: { role: 'user', source: { kind: 'user' }, content: 'second' },
+    })
+    const second = buffer.push(session, {
+      type: 'turn/end',
+      time: Date.parse('2026-10-19T01:01:02Z'),
+      data: { turn: 2, reason: { kind: 'completed' } },
+    })!
+
+    worker.enqueue(first, { workspaceId: 'ws1', rootId: 'default' })
+    worker.enqueue(second, { workspaceId: 'ws1', rootId: 'default' })
+    await worker.flush()
+
+    expect(store.getTurn('session-1:1')?.provider).toBe('provider-x')
+    expect(store.getTurn('session-1:2')?.provider).toBe('provider-x')
+    expect(store.getTurn('session-1:2')?.model).toBe('model-y')
+    worker.dispose()
+    store.close()
+  })
+
+  it('finds an orphan raw turn after more than the limit of existing files', () => {
+    const { dir, store, worker } = setup()
+    const localDate = '2026-10-19'
+    const dateDir = path.join(dir, 'projects', 'ws1', 'turns', localDate)
+    fs.mkdirSync(dateDir, { recursive: true })
+
+    const writeRaw = (name: string, sessionId: string, turn: number): string => {
+      const full = path.join(dateDir, name)
+      fs.writeFileSync(
+        full,
+        [
+          `# Turn ${sessionId} / #${turn}`,
+          '',
+          '- 开始: 2026-10-19T01:00:00.000Z',
+          '- 结束: 2026-10-19T01:00:01.000Z',
+          '- 结束原因: completed',
+          '- 来源: main',
+          '- 工作区: /tmp/ws',
+          '',
+          '## 用户',
+          '',
+          `hello ${turn}`,
+          '',
+        ].join('\n'),
+      )
+      return full
+    }
+
+    for (let index = 0; index < 200; index++) {
+      const name = `a${String(index).padStart(3, '0')}--turn-${index}.md`
+      const full = writeRaw(name, `existing-${index}`, index)
+      const relative = path.relative(dir, full).split(path.sep).join('/')
+      store.ingestTurn(
+        {
+          turnId: `existing-${index}:${index}`,
+          workspaceId: 'ws1',
+          sessionId: `existing-${index}`,
+          turnSeq: index,
+          origin: 'main',
+          endReason: 'completed',
+          occurredAt: '2026-10-19T01:00:00.000Z',
+          localDate,
+          rootId: 'default',
+          rawRelPath: relative,
+          provider: null,
+          model: null,
+        },
+        [],
+        {
+          title: 'existing',
+          conclusion: '',
+          topics: [],
+          status: 'unsummarized',
+          sourceRelPath: relative,
+          rootId: 'default',
+          occurredAt: '2026-10-19T01:00:00.000Z',
+        },
+      )
+    }
+
+    const orphan = writeRaw('zz-orphan--turn-999.md', 's-orphan', 999)
+    fs.writeFileSync(
+      orphan.replace(/\.md$/, '.events.jsonl'),
+      [
+        JSON.stringify({ type: 'request/header', seq: 2, occurredAt: 1, data: { header: { config: { provider: 'p-orphan', model: 'm-orphan' } } } }),
+        // No occurredAt: the header start time must be used, not 1970.
+        JSON.stringify({ type: 'user/message', seq: 3, data: { role: 'user', content: 'orphan' } }),
+        '',
+      ].join('\n'),
+    )
+
+    expect(worker.reconcileRawTurns(200)).toBe(1)
+    const recovered = store.getTurn('s-orphan:999')
+    expect(recovered?.provider).toBe('p-orphan')
+    expect(recovered?.model).toBe('m-orphan')
+    expect(recovered?.raw_events_rel_path).toBe(
+      'projects/ws1/turns/2026-10-19/zz-orphan--turn-999.events.jsonl',
+    )
+    expect(store.countTurnEvents('s-orphan:999')).toBe(2)
+
+    const machine = path.join(dir, 'projects', 'ws1', 'index', `${localDate}.jsonl`)
+    const machineText = fs.readFileSync(machine, 'utf8')
+    expect(machineText).toContain('"sessionId":"s-orphan"')
+    expect(machineText).toContain('"workspacePath":"/tmp/ws"')
+    expect(machineText).not.toContain('1970-01-01')
+
+    worker.dispose()
+    store.close()
+  })
+
+  it('inherits the last persisted model after a worker restart', async () => {
+    const { config, store, worker } = setup()
+    const first = {
+      sessionId: 'session-restart',
+      turn: 1,
+      startedAt: Date.parse('2026-10-19T01:00:00Z'),
+      endedAt: Date.parse('2026-10-19T01:00:01Z'),
+      endReason: 'completed',
+      origin: 'main' as const,
+      workspacePath: null,
+      events: [
+        {
+          type: 'request/header',
+          seq: 1,
+          occurredAt: Date.parse('2026-10-19T01:00:00Z'),
+          data: { header: { config: { provider: 'persisted-p', model: 'persisted-m' } } },
+        },
+      ],
+    }
+    worker.enqueue(first, { workspaceId: 'ws1', rootId: 'default' })
+    await worker.flush()
+    worker.dispose()
+
+    const restarted = new CaptureWorker(store, config)
+    const second = {
+      sessionId: 'session-restart',
+      turn: 2,
+      startedAt: Date.parse('2026-10-19T02:00:00Z'),
+      endedAt: Date.parse('2026-10-19T02:00:01Z'),
+      endReason: 'completed',
+      origin: 'main' as const,
+      workspacePath: null,
+      events: [],
+    }
+    restarted.enqueue(second, { workspaceId: 'ws1', rootId: 'default' })
+    await restarted.flush()
+
+    expect(store.getTurn('session-restart:2')?.provider).toBe('persisted-p')
+    expect(store.getTurn('session-restart:2')?.model).toBe('persisted-m')
+    restarted.dispose()
+    store.close()
+  })
 })

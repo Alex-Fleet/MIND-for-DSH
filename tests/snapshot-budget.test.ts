@@ -71,4 +71,71 @@ describe('snapshot budgets', () => {
     expect(snapshot.length).toBeLessThanOrEqual(2000)
     store.close()
   })
+
+  it('keeps all 30 days when the axis itself fits in the snapshot budget', () => {
+    const { dir, store } = setup()
+    const dates: string[] = []
+    for (let index = 0; index < 30; index++) {
+      const date = new Date(Date.UTC(2026, 9, 19))
+      date.setUTCDate(date.getUTCDate() - index)
+      const localDate = date.toISOString().slice(0, 10)
+      dates.push(localDate)
+      store.upsertDayIndex({
+        workspaceId: 'ws1',
+        localDate,
+        title: 't'.repeat(80),
+        turnCount: 3,
+        reportRelPath: `projects/ws1/days/${localDate}-${'x'.repeat(100)}.md`,
+        rootId: 'default',
+        sourceTurnIds: [],
+      })
+    }
+
+    const snapshot = buildSnapshot({
+      store,
+      workspaceId: 'ws1',
+      rootPath: dir,
+      localDate: '2026-10-19',
+      dayBoundaryMinutes: 240,
+      maxChars: 12_000,
+    })
+
+    for (const date of dates) expect(snapshot).toContain(date)
+    expect(snapshot).not.toContain('已截断')
+    expect(snapshot.length).toBeLessThanOrEqual(12_000)
+    store.close()
+  })
+
+  it('never exceeds maxChars when a truncation marker is needed', () => {
+    const { dir, store } = setup()
+    for (let index = 0; index < 5; index++) {
+      const localDate = `2026-10-${String(15 + index).padStart(2, '0')}`
+      store.upsertDayIndex({
+        workspaceId: 'ws1',
+        localDate,
+        title: 't'.repeat(80),
+        turnCount: 3,
+        reportRelPath: `projects/ws1/days/${localDate}-${'x'.repeat(100)}.md`,
+        rootId: 'default',
+        sourceTurnIds: [],
+      })
+    }
+
+    for (const maxChars of [305, 450, 550, 1000]) {
+      const snapshot = buildSnapshot({
+        store,
+        workspaceId: 'ws1',
+        rootPath: dir,
+        localDate: '2026-10-19',
+        dayBoundaryMinutes: 240,
+        maxChars,
+      })
+      expect(snapshot.length).toBeLessThanOrEqual(maxChars)
+      // Truncation must drop older days first, never the most recent one.
+      if (maxChars >= 1000) {
+        expect(snapshot).toContain('2026-10-19')
+      }
+    }
+    store.close()
+  })
 })

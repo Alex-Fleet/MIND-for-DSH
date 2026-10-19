@@ -11,7 +11,14 @@ export const SUMMARY_MAX_INPUT_CHARS = 30_000
  * and never produces prose outside the JSON object.
  */
 export function buildSummaryPrompt(turn: CapturedTurn, markdown: string): string {
-  const safe = redactSecrets(markdown)
+  // Cut before redacting, but keep a forward window so a credential that
+  // crosses the 30k boundary is still matched. Redacting a whole multi-MB turn
+  // can be quadratic on pathological single lines.
+  const REDACT_WINDOW_CHARS = 1_000_000
+  const window = markdown.length > SUMMARY_MAX_INPUT_CHARS + REDACT_WINDOW_CHARS
+    ? markdown.slice(0, SUMMARY_MAX_INPUT_CHARS + REDACT_WINDOW_CHARS)
+    : markdown
+  const safe = redactSecrets(window)
   const body =
     safe.length > SUMMARY_MAX_INPUT_CHARS
       ? `${safe.slice(0, SUMMARY_MAX_INPUT_CHARS)}\n\n[内容过长已截断；完整原文见 ${turn.sessionId} turn #${turn.turn}]`

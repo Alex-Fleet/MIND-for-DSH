@@ -42,10 +42,22 @@ export function createLlmSummarizer(options: LlmSummarizerOptions): SummarizeFn 
       return null
     }
 
-    const selected = detectModel(turn) ?? {
-      provider: options.provider ?? 'deepseek-official',
-      model: options.model ?? 'deepseek-flash',
-    }
+    // An explicit profile setting wins; the turn's request model is the
+    // default when no provider/model was configured. Provider and model are a
+    // pair: configuring only one must not mix it with the other from the
+    // turn, which may belong to a different provider.
+    const detected = detectModel(turn)
+    const configuredProvider = options.provider !== undefined && options.provider !== ''
+    const configuredModel = options.model !== undefined && options.model !== ''
+    const selected = configuredProvider || configuredModel
+      ? {
+          provider: configuredProvider ? String(options.provider) : 'deepseek-official',
+          model: configuredModel ? String(options.model) : 'deepseek-flash',
+        }
+      : {
+          provider: detected?.provider ?? 'deepseek-official',
+          model: detected?.model ?? 'deepseek-flash',
+        }
 
     const controller = new AbortController()
     let timer: ReturnType<typeof setTimeout> | undefined

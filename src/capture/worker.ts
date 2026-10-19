@@ -10,6 +10,7 @@ import type { TurnSummary } from '../summarize/parse.js'
 import { rebuildDayIndex, rebuildMonthIndex, rebuildWeekIndex } from '../views/navigation.js'
 import { detectModel } from '../summarize/llm.js'
 import { previewFromMarkdown, readTurnPreview } from '../turns/preview.js'
+import { countChars } from '../turns/read.js'
 import { localDateOf } from '../time.js'
 import { redactSecrets } from '../security/redact.js'
 
@@ -26,6 +27,12 @@ interface PendingIngest {
 export class CaptureWorker {
   private readonly recent = new Map<string, CapturedTurn>()
   private readonly pending = new Map<string, PendingIngest>()
+  /**
+   * The last request model seen per session. DSH only records
+   * `request/header` on initial/resume/route changes, so later turns in the
+   * same loop carry no model event of their own.
+   */
+  private readonly sessionModels = new Map<string, { provider: string; model: string }>()
   private activeDrain: Promise<void> | null = null
   private disposed = false
   private readonly owner = `mind-${process.pid}`
@@ -84,6 +91,7 @@ export class CaptureWorker {
     this.pending.clear()
     this.disposed = true
     this.recent.clear()
+    this.sessionModels.clear()
   }
 
   /** Recover jobs left running by a crashed process. */
@@ -111,7 +119,7 @@ export class CaptureWorker {
   private ingest(item: PendingIngest): void {
     const { turn, context } = item
     const workspaceId = context.workspaceId ?? 'orphan'
-    const localDate = localDateOf(turn.startedAt)
+    const localDate = localDateOf(turn.startedAt, this.config.dayBoundaryMinutes)
     const safeId = safeTurnFileName(turn)
     const rawRelPath = path.posix.join('projects', workspaceId, 'turns', localDate, `${safeId}.md`)
     const machineRelPath = path.posix.join('projects', workspaceId, 'index', `${localDate}.jsonl`)
@@ -120,14 +128,20 @@ export class CaptureWorker {
     const eventsRelPath = rawRelPath.replace(/\.md$/, '.events.jsonl')
     const turnId = `${turn.sessionId}:${turn.turn}`
     const occurredAt = new Date(turn.startedAt).toISOString()
-    const isNew = this.store.getTurn(turnId) === undefined
 
     // Raw artifacts first: they are the durable source of truth even if the
     // database commit below fails. Startup reconciliation can rebuild the
-    // database row from them.
+    // database row from them. The machine line is keyed by session/turn and
+    // appended idempotently, so a retry after a failed DB commit cannot
+    // duplicate it.
     writeAtomic(path.join(this.config.mindRoot, rawRelPath), markdown)
     writeAtomic(path.join(this.config.mindRoot, eventsRelPath), renderEventsJsonl(turn))
-    if (isNew) appendLine(path.join(this.config.mindRoot, machineRelPath), turnMachineLine(turn))
+    appendLineIfAbsent(
+      path.join(this.config.mindRoot, machineRelPath),
+      turn.sessionId,
+      turn.turn,
+      turnMachineLine(turn),
+    )
 
     const events: TurnEventRow[] = turn.events.map(event => ({
       kind: event.type,
@@ -136,7 +150,17 @@ export class CaptureWorker {
       bytes: byteLength(event.data),
     }))
 
-    const selectedModel = detectModel(turn)
+    const detected = detectModel(turn)
+    if (detected !== null) this.sessionModels.set(turn.sessionId, detected)
+    while (this.sessionModels.size > 500) {
+      const oldest = this.sessionModels.keys().next().value
+      if (oldest === undefined) break
+      this.sessionModels.delete(oldest)
+    }
+    const selectedModel =
+      detected ??
+      this.sessionModels.get(turn.sessionId) ??
+      this.store.findLastTurnModel(turn.sessionId)
     this.recent.set(turnId, turn)
     // Bounded cache: the summary normally runs immediately, but a job that
     // waits must not retain every event payload forever.
@@ -247,73 +271,116 @@ export class CaptureWorker {
     const base = path.join(this.config.mindRoot, 'projects')
     if (!fs.existsSync(base)) return 0
     const days = new Map<string, { workspaceId: string; localDate: string; rootId: string }>()
-    let scanned = 0
-    let inserted = 0
 
-    const workspaceDirs = fs.readdirSync(base, { withFileTypes: true })
-    for (const workspaceEntry of workspaceDirs) {
-      if (scanned >= limit) break
+    // Stream directories in deterministic order. Only successful recoveries
+    // count toward the limit, so existing files cannot starve a later orphan;
+    // one corrupt file must not abort the rest of the scan.
+    let inserted = 0
+    outer:
+    for (const workspaceEntry of sortedEntries(base)) {
       if (!workspaceEntry.isDirectory()) continue
       const workspaceId = workspaceEntry.name
       const turnsDir = path.join(base, workspaceId, 'turns')
       if (!fs.existsSync(turnsDir)) continue
-      for (const dateEntry of fs.readdirSync(turnsDir, { withFileTypes: true })) {
-        if (scanned >= limit) break
+      for (const dateEntry of sortedEntries(turnsDir)) {
         if (!dateEntry.isDirectory() || !/^\d{4}-\d{2}-\d{2}$/.test(dateEntry.name)) continue
         const localDate = dateEntry.name
         const dateDir = path.join(turnsDir, localDate)
-        for (const fileEntry of fs.readdirSync(dateDir, { withFileTypes: true })) {
-          if (scanned >= limit) break
+        for (const fileEntry of sortedEntries(dateDir)) {
+          if (inserted >= limit) break outer
           if (!fileEntry.isFile() || !fileEntry.name.endsWith('.md') || fileEntry.name.includes('.tmp-')) continue
-          scanned += 1
           const full = path.join(dateDir, fileEntry.name)
-          const relative = path.relative(this.config.mindRoot, full).split(path.sep).join('/')
-          let content: string
+          const header = readRawHeader(full)
+          if (header === null) continue
+          const turnId = `${header.sessionId}:${header.turnSeq}`
+          if (this.store.getTurn(turnId) !== undefined) continue
+
+          // Recover from the head plus a streaming character count; a
+          // multi-hundred-MB orphan must not be loaded as one string.
+          const head = readHead(full, 64 * 1024)
+          if (head === '') continue
+          let rawChars: number
           try {
-            content = fs.readFileSync(full, 'utf8')
+            rawChars = countChars(full)
           } catch {
             continue
           }
-          const header = /^# Turn (.+?) \/ #(\d+)\s*$/m.exec(content)
-          if (header === null) continue
-          const sessionId = header[1] ?? ''
-          const turnSeq = Number(header[2] ?? 0)
-          if (sessionId === '' || !Number.isInteger(turnSeq)) continue
-          const turnId = `${sessionId}:${turnSeq}`
-          if (this.store.getTurn(turnId) !== undefined) continue
-          const startMatch = /^- 开始:\s*(.+)$/m.exec(content)
-          const endMatch = /^- 结束原因:\s*(.+)$/m.exec(content)
-          const originMatch = /^- 来源:\s*(.+)$/m.exec(content)
-          const occurredAt = startMatch?.[1]?.trim() ?? new Date().toISOString()
+          const relative = path.relative(this.config.mindRoot, full).split(path.sep).join('/')
+          const eventsPath = full.replace(/\.md$/, '.events.jsonl')
+          const events = readEventsFile(eventsPath, parseTimestamp(header.occurredAt))
+          const startedAt = parseTimestamp(header.occurredAt)
+          const turn: CapturedTurn = {
+            sessionId: header.sessionId,
+            turn: header.turnSeq,
+            startedAt,
+            endedAt: events.at(-1)?.occurredAt ?? startedAt,
+            endReason: header.endReason,
+            origin: header.origin,
+            workspacePath: header.workspacePath,
+            events,
+          }
+          const detected = detectModel(turn)
+          if (detected !== null) this.sessionModels.set(turn.sessionId, detected)
+          const selectedModel =
+            detected ??
+            this.sessionModels.get(turn.sessionId) ??
+            this.store.findLastTurnModel(header.sessionId)
           const rootId = 'default'
-          this.store.ingestTurn(
-            {
-              turnId,
-              workspaceId,
-              sessionId,
-              turnSeq,
-              origin: originMatch?.[1]?.trim() === 'subagent' ? 'subagent' : 'main',
-              endReason: endMatch?.[1]?.trim() ?? null,
-              occurredAt,
-              localDate,
-              rootId,
-              rawRelPath: relative,
-              rawEventsRelPath: relative.replace(/\.md$/, '.events.jsonl'),
-              rawChars: content.length,
-              provider: null,
-              model: null,
-            },
-            [],
-            {
-              title: previewFromMarkdown(content) ?? '(未摘要)',
-              conclusion: '',
-              topics: [],
-              status: 'unsummarized',
-              sourceRelPath: relative,
-              rootId,
-              occurredAt,
-            },
-          )
+          const eventRows: TurnEventRow[] = events.map(event => ({
+            kind: event.type,
+            seq: event.seq,
+            toolName: toolNameOf(event.data),
+            bytes: byteLength(event.data),
+          }))
+          // Write the secondary index before the DB commit, like live ingest:
+          // if it fails, the next startup retries instead of skipping an
+          // already-committed turn with a permanently missing machine line.
+          try {
+            appendLineIfAbsent(
+              path.join(this.config.mindRoot, 'projects', workspaceId, 'index', `${localDate}.jsonl`),
+              header.sessionId,
+              header.turnSeq,
+              turnMachineLine(turn),
+            )
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            console.warn(`[mind-dsh] machine index append failed for ${relative}: ${message}`)
+            continue
+          }
+          try {
+            this.store.ingestTurn(
+              {
+                turnId,
+                workspaceId,
+                sessionId: header.sessionId,
+                turnSeq: header.turnSeq,
+                origin: header.origin,
+                endReason: header.endReason,
+                occurredAt: new Date(startedAt).toISOString(),
+                localDate,
+                rootId,
+                rawRelPath: relative,
+                rawEventsRelPath: fs.existsSync(eventsPath) ? relative.replace(/\.md$/, '.events.jsonl') : null,
+                rawChars,
+                provider: selectedModel?.provider ?? null,
+                model: selectedModel?.model ?? null,
+              },
+              eventRows,
+              {
+                title: previewFromMarkdown(head) ?? '(未摘要)',
+                conclusion: '',
+                topics: [],
+                status: 'unsummarized',
+                sourceRelPath: relative,
+                rootId,
+                occurredAt: new Date(startedAt).toISOString(),
+              },
+            )
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            console.warn(`[mind-dsh] raw recovery failed for ${relative}: ${message}`)
+            continue
+          }
           inserted += 1
           days.set(`${workspaceId}|${localDate}`, { workspaceId, localDate, rootId })
         }
@@ -465,16 +532,18 @@ export class CaptureWorker {
     const cached = this.recent.get(job.turnId)
     if (cached !== undefined) return cached
     const startedAt = Date.parse(String(row.occurred_at ?? new Date().toISOString()))
+    const sessionId = String(row.session_id ?? job.sessionId)
+    const fallback = this.store.findLastTurnModel(sessionId)
     return {
-      sessionId: String(row.session_id ?? job.sessionId),
+      sessionId,
       turn: Number(row.turn_seq ?? job.turnSeq),
       startedAt: Number.isFinite(startedAt) ? startedAt : Date.now(),
       endedAt: Number.isFinite(startedAt) ? startedAt : Date.now(),
       endReason: row.end_reason === null || row.end_reason === undefined ? null : String(row.end_reason),
       origin: origin === 'subagent' ? 'subagent' : 'main',
       workspacePath: null,
-      provider: typeof row.provider === 'string' ? row.provider : null,
-      model: typeof row.model === 'string' ? row.model : null,
+      provider: typeof row.provider === 'string' ? row.provider : fallback?.provider ?? null,
+      model: typeof row.model === 'string' ? row.model : fallback?.model ?? null,
       events: [],
     }
   }
@@ -517,6 +586,156 @@ function readSafe(target: string): string {
   } catch {
     return ''
   }
+}
+
+function parseTimestamp(value: string): number {
+  const parsed = Date.parse(value)
+  return Number.isFinite(parsed) ? parsed : Date.now()
+}
+
+function readHead(target: string, maxBytes: number): string {
+  let fd: number | undefined
+  try {
+    fd = fs.openSync(target, 'r')
+    const buffer = Buffer.allocUnsafe(maxBytes)
+    const bytes = fs.readSync(fd, buffer, 0, maxBytes, 0)
+    return buffer.subarray(0, bytes).toString('utf8')
+  } catch {
+    return ''
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd)
+  }
+}
+
+function sortedEntries(dir: string): fs.Dirent[] {
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name))
+  } catch {
+    return []
+  }
+}
+
+function readRawHeader(
+  target: string,
+): {
+  sessionId: string
+  turnSeq: number
+  occurredAt: string
+  endReason: string | null
+  origin: 'main' | 'subagent'
+  workspacePath: string | null
+} | null {
+  const head = readHead(target, 8192)
+  const header = /^# Turn (.+?) \/ #(\d+)\s*$/m.exec(head)
+  if (header === null) return null
+  const sessionId = header[1] ?? ''
+  const turnSeq = Number(header[2] ?? 0)
+  if (sessionId === '' || !Number.isInteger(turnSeq)) return null
+  const start = /^- 开始:\s*(.+)$/m.exec(head)?.[1]?.trim()
+  const end = /^- 结束原因:\s*(.+)$/m.exec(head)?.[1]?.trim()
+  const origin = /^- 来源:\s*(.+)$/m.exec(head)?.[1]?.trim()
+  const workspace = /^- 工作区:\s*(.+)$/m.exec(head)?.[1]?.trim()
+  return {
+    sessionId,
+    turnSeq,
+    occurredAt: start ?? new Date().toISOString(),
+    endReason: end ?? null,
+    origin: origin === 'subagent' ? 'subagent' : 'main',
+    workspacePath: workspace === undefined || workspace === '(unknown)' ? null : workspace,
+  }
+}
+
+function readEventsFile(target: string, fallbackTime = 0): CapturedTurn['events'] {
+  let raw: string
+  try {
+    const stat = fs.statSync(target)
+    raw = stat.size > 16 * 1024 * 1024
+      ? readHead(target, 16 * 1024 * 1024)
+      : fs.readFileSync(target, 'utf8')
+  } catch {
+    return []
+  }
+  const events: CapturedTurn['events'] = []
+  for (const line of raw.split('\n')) {
+    if (line.trim() === '') continue
+    try {
+      const record = JSON.parse(line) as Record<string, unknown>
+      if (typeof record.type !== 'string') continue
+      events.push({
+        type: record.type,
+        seq: typeof record.seq === 'number' ? record.seq : null,
+        occurredAt: typeof record.occurredAt === 'number' ? record.occurredAt : fallbackTime,
+        data: record.data,
+      })
+    } catch {
+      // A truncated/corrupt event line must not block recovering the turn.
+    }
+  }
+  return events
+}
+
+interface MachineCacheEntry {
+  keys: Set<string>
+  stamp: string
+}
+
+const machineLineCache = new Map<string, MachineCacheEntry>()
+
+function fileStamp(target: string): string {
+  try {
+    const stat = fs.statSync(target)
+    // ctime catches same-size rewrites even if mtime is restored.
+    return `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}`
+  } catch {
+    return 'missing'
+  }
+}
+
+function trimMachineLineCache(): void {
+  while (machineLineCache.size > 100) {
+    const oldest = machineLineCache.keys().next().value
+    if (oldest === undefined) break
+    machineLineCache.delete(oldest)
+  }
+}
+
+function appendLineIfAbsent(target: string, sessionId: string, turn: number, line: string): void {
+  const key = `${sessionId}:${turn}`
+  const stamp = fileStamp(target)
+  let entry = machineLineCache.get(target)
+  if (entry === undefined || entry.stamp !== stamp) {
+    const keys = new Set<string>()
+    if (stamp !== 'missing') {
+      try {
+        for (const existing of fs.readFileSync(target, 'utf8').split('\n')) {
+          if (existing.trim() === '') continue
+          try {
+            const record = JSON.parse(existing) as Record<string, unknown>
+            if (typeof record.sessionId === 'string' && typeof record.turn === 'number') {
+              keys.add(`${record.sessionId}:${record.turn}`)
+            }
+          } catch {
+            // Keep scanning; one corrupt line must not create a duplicate.
+          }
+        }
+      } catch {
+        // Fall through to the append; a read failure is not a reason to drop it.
+      }
+    }
+    entry = { keys, stamp }
+    machineLineCache.set(target, entry)
+  }
+  if (entry.keys.has(key)) {
+    trimMachineLineCache()
+    return
+  }
+
+  appendLine(target, line)
+  entry.keys.add(key)
+  entry.stamp = fileStamp(target)
+  trimMachineLineCache()
 }
 
 function renderEventsJsonl(turn: CapturedTurn): string {
@@ -563,6 +782,12 @@ function appendLine(target: string, line: string): void {
   fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 })
   const fd = fs.openSync(target, 'a', 0o600)
   try {
+    // open mode only applies to a newly created file; tighten upgraded files.
+    try {
+      fs.fchmodSync(fd, 0o600)
+    } catch {
+      // Filesystems without POSIX modes.
+    }
     fs.writeFileSync(fd, `${line}\n`, 'utf8')
     fs.fsyncSync(fd)
   } finally {

@@ -91,9 +91,14 @@ export function loadPersistedSettings(mindRoot: string): PersistedSettings {
 
 /** Atomically persist the UI-owned settings. */
 export function savePersistedSettings(mindRoot: string, settings: PersistedSettings): void {
-  fs.mkdirSync(mindRoot, { recursive: true })
+  fs.mkdirSync(mindRoot, { recursive: true, mode: 0o700 })
   const target = path.join(mindRoot, 'settings.json')
   const temp = `${target}.tmp-${process.pid}-${Date.now()}`
-  fs.writeFileSync(temp, `${JSON.stringify(settings, null, 2)}\n`, 'utf8')
+  fs.writeFileSync(temp, `${JSON.stringify(settings, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
   fs.renameSync(temp, target)
+  try {
+    fs.chmodSync(target, 0o600)
+  } catch {
+    // Filesystems without POSIX modes.
+  }
 }
