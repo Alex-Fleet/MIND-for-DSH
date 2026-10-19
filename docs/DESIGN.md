@@ -1,6 +1,6 @@
 # MIND for DSH — 设计文档
 
-> 版本：**v0.3**（已吸收两轮对抗性审查）
+> 版本：**v0.4**（已吸收两轮对抗性审查 + Step 1–6 实现反馈）
 > 目标：在 DeepSeek Harness 上实现**全量保留、可导航、自动捕获**的记忆系统。
 
 ---
@@ -38,6 +38,18 @@
 | 16 | 时间轴标题过长 | 标题硬截断 24 字；月份行单独预算 |
 | 17 | 当前认知无选取算法 | 分层配额 + 每条 ≤80 字 + 总上限 2200 |
 
+### v0.3 → v0.4（实现反馈，Step 1–6 已落地）
+
+| 实现决定 | 原因 |
+|---|---|
+| 摘要改为 `ctx.get('llm').stream` 一次调用 | `turn/end` 后父 Agent 的 loop 已停止，`startActivation` 报 `agent loop is not active`；一次性 LLM 调用不需要活跃 loop，也没有工具/历史 |
+| 原始落盘在监听器内同步执行（毫秒级） | headless 一次性进程可能在 `setImmediate` 前退出；原文必须立即持久化。摘要仍异步 |
+| `turn/end` 后立即 `drain()` | LLM 请求是活跃句柄，进程会等到它完成；启动 kick + 周期 drain 补偿崩溃/一次性退出 |
+| 动态增量走 `agent/pre-step` | `systemPrompt.context` 是合并快照；每轮变化会整份追加。增量作为一条小 user 消息追加（<200 字符） |
+| 静态规范走 `systemPrompt.section`，函数式读取 | 14,831 字符常驻且字节稳定；文件变更时按 mtime 重读 |
+| 工具注册用 `inject: ['systemPrompt','tools']` | Cordis 直接属性访问需要 inject；未注入时 `ctx.get('tools')` 拿不到服务 |
+| 摘要失败重试 | 直接 LLM 调用失败/JSON 非法 → job 回到 pending，指数退避，5 次后 dead |
+
 ---
 
 ## 0.5 Spike 实测结果（2026-10-19，DSH 0.2.1-rc.2）
@@ -71,7 +83,7 @@
 | 原文全存 | ⚠️ 丢 tool_result | ✅ | ✅ 全事件（旧数据尽力） |
 | 摘要带地址 | ❌ | ✅ | ✅ |
 | 知道历史有什么 | ✅ 时间轴 | ❌ 只有今天 | ✅ 时间轴常驻 |
-| 写入不依赖主代理 | ❌ hook 内串行 | ✅ | ✅ 事件+队列+子代理 |
+| 写入不依赖主代理 | ❌ hook 内串行 | ✅ | ✅ 事件+队列+辅助模型调用 |
 | 工作区跟随 | ❌ | ❌ | ✅ 三级身份 |
 
 ### 不可违背的原则
@@ -88,7 +100,7 @@
 ## 2. 继承与取舍
 
 **从 MIND**：时间轴披露链、每轮硬约束、SQLite、日报/周报/月报（改为导航视图）。
-**从 Aik358**：原文归档+索引+下钻、宿主触发子代理、预算与配额、静态/动态分离、来源身份标注。
+**从 Aik358**：原文归档+索引+下钻、宿主触发辅助模型调用、预算与配额、静态/动态分离、来源身份标注。
 **不做**：重型配置/路由/工具、v1 语义检索、团队/多用户/移动端、摘要替代原文。
 
 ---
@@ -100,7 +112,7 @@ session/event(turn/end)
   → 监听器只登记 (session_id, turn, end_seq) 到内存队列
   → worker 读取该 turn 的事件（内存缓冲或 sessionQuery 窗口）
   → 写 raw（temp+rename）+ turns + capture_job（同事务）
-  → 队列消费 → 独立子代理（子代理 session 走 raw-only）
+  → 队列消费 → 辅助 LLM 一次调用（无工具、无会话历史）
   → 写 turn_index / day_index / period_index
 ```
 
@@ -340,7 +352,7 @@ for job in capture_job where state=pending and next_at<=now:
    if origin == 'subagent':
        write machine index only; DONE   # 不 spawn、不进注入
    else:
-       spawn capture subagent (delivery:'caller', maxDepth:1)
+       call auxiliary llm.stream (one-shot, no tools/history)
        validate JSON → upsert turn_index / proposals
    update watermark
 ```
