@@ -12,12 +12,13 @@ import { buildIncrement } from './inject/increment.js'
 import { buildSnapshot } from './inject/snapshot.js'
 import { createStandardsProvider } from './inject/standards.js'
 import { createLlmSummarizer } from './summarize/llm.js'
+import { registerMindTools } from './tools/mind-tools.js'
 import type { MindContext } from './types.js'
 
 export const name = 'mind-dsh'
 
 /** Services required before apply() runs. */
-export const inject = ['systemPrompt'] as const
+export const inject = ['systemPrompt', 'tools'] as const
 
 const ROOT_ID = 'default'
 const CONTEXT_SOURCE = { kind: 'mind-dsh' } as const
@@ -109,42 +110,50 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
       }),
   })
 
-  ctx.on('session/event', (sessionRaw: unknown, eventRaw: unknown) => {
-    const session = sessionRaw as SessionLike
-    const workspaceId = ensureWorkspace(session.header?.cwd ?? null)
-    if (!config.captureEnabled) return
-    const finished = buffer.push(session, eventRaw as EventLike)
-    if (finished === null) return
-    worker.enqueue(finished, {
-      workspaceId: workspaceId ?? workspaceIdFor(finished.workspacePath),
-      rootId: ROOT_ID,
-    })
-  })
+  registerMindTools(c.tools, store, config.mindRoot)
 
-  ctx.on('agent/pre-step', async (payload: unknown, next: () => Promise<unknown>): Promise<PreStepDecision> => {
-    const downstream = (await next()) as PreStepDecision
-    if (downstream.kind !== 'enter') return downstream
+  ctx.on(
+    'session/event',
+    ((sessionRaw: unknown, eventRaw: unknown) => {
+      const session = sessionRaw as SessionLike
+      const workspaceId = ensureWorkspace(session.header?.cwd ?? null)
+      if (!config.captureEnabled) return
+      const finished = buffer.push(session, eventRaw as EventLike)
+      if (finished === null) return
+      worker.enqueue(finished, {
+        workspaceId: workspaceId ?? workspaceIdFor(finished.workspacePath),
+        rootId: ROOT_ID,
+      })
+    }) as never,
+  )
 
-    const input = payload as PreStepPayload
-    if (input.step !== 1) return downstream
+  ctx.on(
+    'agent/pre-step',
+    (async (payload: unknown, next: () => Promise<unknown>): Promise<PreStepDecision> => {
+      const downstream = (await next()) as PreStepDecision
+      if (downstream.kind !== 'enter') return downstream
 
-    const workspaceId = ensureWorkspace(input.agent?.session?.header?.cwd ?? null) ?? currentWorkspaceId
-    if (workspaceId === null) return downstream
+      const input = payload as PreStepPayload
+      if (input.step !== 1) return downstream
 
-    const increment = buildIncrement(store, workspaceId, localDateOf(Date.now(), config.dayBoundaryMinutes))
-    if (increment === null) return downstream
+      const workspaceId = ensureWorkspace(input.agent?.session?.header?.cwd ?? null) ?? currentWorkspaceId
+      if (workspaceId === null) return downstream
 
-    const sessionId = input.agent?.session?.id ?? 'unknown'
-    if (lastIncrement.get(sessionId) === increment) return downstream
-    lastIncrement.set(sessionId, increment)
+      const increment = buildIncrement(store, workspaceId, localDateOf(Date.now(), config.dayBoundaryMinutes))
+      if (increment === null) return downstream
 
-    const message = createUserMessage({
-      content: [{ type: 'text', text: increment }],
-      source: CONTEXT_SOURCE as never,
-    })
+      const sessionId = input.agent?.session?.id ?? 'unknown'
+      if (lastIncrement.get(sessionId) === increment) return downstream
+      lastIncrement.set(sessionId, increment)
 
-    return { ...downstream, messages: [...downstream.messages, message] }
-  })
+      const message = createUserMessage({
+        content: [{ type: 'text', text: increment }],
+        source: CONTEXT_SOURCE as never,
+      })
+
+      return { ...downstream, messages: [...downstream.messages, message] }
+    }) as never,
+  )
 
   ctx.effect(() => () => {
     clearTimeout(kick)

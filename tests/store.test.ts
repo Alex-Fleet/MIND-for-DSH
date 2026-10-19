@@ -76,6 +76,26 @@ describe('Store', () => {
     store.close()
   })
 
+  it('searches the turn index and falls back to substring matching', () => {
+    const store = tempStore()
+    store.insertTurnAndJob(turn, [])
+    store.upsertTurnIndex({
+      turnId: 's1:1',
+      title: '修复注入超时',
+      conclusion: '根因是竞态',
+      topics: ['注入'],
+      sourceRelPath: 'projects/ws1/turns/2026-10-19/x.md',
+      rootId: 'default',
+      occurredAt: '2026-10-19T01:00:00.000Z',
+    })
+
+    const rows = store.searchTurnIndex('注入', 10)
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.title).toBe('修复注入超时')
+    expect(store.searchTurnIndex('不存在的词', 10)).toHaveLength(0)
+    store.close()
+  })
+
   it('tracks per-session watermarks without moving backwards', () => {
     const store = tempStore()
     store.setWatermark('s1', 10)

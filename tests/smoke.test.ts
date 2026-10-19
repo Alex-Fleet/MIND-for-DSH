@@ -17,6 +17,7 @@ function fakeContext() {
       context: () => () => {},
       getSectionOrder: () => 1000,
     },
+    tools: { register: () => {} },
     on: (event: string, listener: (...args: unknown[]) => void) => {
       listeners.push({ event, listener })
       return () => {}

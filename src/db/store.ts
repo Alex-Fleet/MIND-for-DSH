@@ -575,6 +575,36 @@ export class Store {
       | undefined
   }
 
+  searchTurnIndex(query: string, limit: number): Array<Record<string, unknown>> {
+    const safe = `"${query.replace(/"/g, '""')}"`
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT ti.turn_id, ti.title, ti.conclusion, ti.source_rel_path, ti.occurred_at
+           FROM turn_index_fts f
+           JOIN turn_index ti ON ti.rowid = f.rowid
+           WHERE turn_index_fts MATCH ?
+           ORDER BY rank
+           LIMIT ?`,
+        )
+        .all(safe, limit) as Array<Record<string, unknown>>
+      if (rows.length > 0) return rows
+    } catch {
+      // fall through to the substring fallback
+    }
+    // unicode61 does not split CJK phrases into useful tokens; substring
+    // matching keeps search usable for Chinese memory entries.
+    return this.db
+      .prepare(
+        `SELECT turn_id, title, conclusion, source_rel_path, occurred_at
+         FROM turn_index
+         WHERE title LIKE ? OR conclusion LIKE ?
+         ORDER BY occurred_at DESC
+         LIMIT ?`,
+      )
+      .all(`%${query}%`, `%${query}%`, limit) as Array<Record<string, unknown>>
+  }
+
   countTurns(): number {
     return Number((this.db.prepare('SELECT COUNT(*) AS c FROM turns').get() as { c: number }).c)
   }
