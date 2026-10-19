@@ -26,7 +26,7 @@ function setup() {
 const session = { id: 'session-1', header: { cwd: '/tmp/workspace' } }
 
 describe('CaptureWorker', () => {
-  it('writes a readable raw turn and completes its job', () => {
+  it('writes a readable raw turn and completes its job', async () => {
     const { dir, store, worker } = setup()
     const buffer = new TurnBuffer()
 
@@ -48,7 +48,7 @@ describe('CaptureWorker', () => {
     })!
 
     worker.enqueue(finished, { workspaceId: 'ws1', rootId: 'default' })
-    worker.flush()
+    await worker.flush()
 
     expect(store.countTurns()).toBe(1)
     expect(store.listJobs('done')).toHaveLength(1)
@@ -72,7 +72,7 @@ describe('CaptureWorker', () => {
     store.close()
   })
 
-  it('handles two sessions concurrently without mixing turns', () => {
+  it('handles two sessions concurrently without mixing turns', async () => {
     const { store, worker } = setup()
     const buffer = new TurnBuffer()
     const a = { id: 'session-a', header: { cwd: '/tmp/a' } }
@@ -87,7 +87,7 @@ describe('CaptureWorker', () => {
 
     worker.enqueue(doneA, { workspaceId: 'ws-a', rootId: 'default' })
     worker.enqueue(doneB, { workspaceId: 'ws-b', rootId: 'default' })
-    worker.flush()
+    await worker.flush()
 
     expect(store.countTurns()).toBe(2)
     expect(store.getTurn('session-a:1')?.workspace_id).toBe('ws-a')

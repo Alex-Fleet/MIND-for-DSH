@@ -1,10 +1,13 @@
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { ResolvedConfig } from '../config.js'
-import type { Store, TurnEventRow } from '../db/store.js'
-import { nowIso } from '../db/store.js'
+import type { ClaimedJob, Store, TurnEventRow } from '../db/store.js'
 import { renderTurnMarkdown, turnMachineLine } from './render.js'
 import type { CapturedTurn } from './types.js'
+import type { SummarizeFn } from '../summarize/llm.js'
+import type { TurnSummary } from '../summarize/parse.js'
+import { rebuildDayIndex, rebuildMonthIndex, rebuildWeekIndex } from '../views/navigation.js'
 
 export interface IngestContext {
   workspaceId: string | null
@@ -17,33 +20,47 @@ interface PendingIngest {
 }
 
 export class CaptureWorker {
-  private readonly pending: PendingIngest[] = []
-  private scheduled = false
-  private draining = false
+  private readonly recent = new Map<string, CapturedTurn>()
+  private activeDrain: Promise<void> | null = null
   private disposed = false
   private readonly owner = `mind-${process.pid}`
 
   constructor(
     private readonly store: Store,
     private readonly config: ResolvedConfig,
+    private readonly summarize?: SummarizeFn,
   ) {}
 
-  /** Queue a completed turn. The caller never blocks on disk or SQLite. */
+  /**
+   * Persist a completed turn.
+   *
+   * The raw file and index row are written synchronously (milliseconds) so a
+   * one-shot headless process cannot exit before the original is durable.
+   * Summarization stays asynchronous.
+   */
   enqueue(turn: CapturedTurn, context: IngestContext): void {
     if (this.disposed) return
-    this.pending.push({ turn, context })
-    this.schedule()
+    try {
+      this.ingest({ turn, context })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      console.error(`[mind-dsh] capture failed: ${message}`)
+      return
+    }
+    // Start immediately: the summary request is an active handle, so a
+    // one-shot headless process stays alive until it settles.
+    void this.drain()
   }
 
   /** Process everything queued right now (tests and shutdown). */
-  flush(): void {
-    this.drain()
+  async flush(): Promise<void> {
+    await this.drain()
   }
 
   /** Stop accepting work; safe to call before closing the store. */
   dispose(): void {
     this.disposed = true
-    this.pending.length = 0
+    this.recent.clear()
   }
 
   /** Recover jobs left running by a crashed process. */
@@ -51,47 +68,28 @@ export class CaptureWorker {
     return this.store.recoverStaleJobs()
   }
 
-  private schedule(): void {
-    if (this.scheduled || this.disposed) return
-    this.scheduled = true
-    setImmediate(() => {
-      this.scheduled = false
-      this.drain()
+  private async drain(): Promise<void> {
+    if (this.disposed) return
+    if (this.activeDrain !== null) return this.activeDrain
+    const run = this.consumeJobs().catch(error => {
+      const message = error instanceof Error ? error.message : String(error)
+      console.error(`[mind-dsh] drain failed: ${message}`)
     })
-  }
-
-  private drain(): void {
-    if (this.draining || this.disposed) return
-    this.draining = true
+    this.activeDrain = run
     try {
-      while (this.pending.length > 0) {
-        const item = this.pending.shift()
-        if (item === undefined) break
-        this.ingest(item)
-      }
-      this.consumeJobs()
+      await run
     } finally {
-      this.draining = false
+      if (this.activeDrain === run) this.activeDrain = null
     }
   }
 
   private ingest(item: PendingIngest): void {
     const { turn, context } = item
+    const workspaceId = context.workspaceId ?? 'orphan'
     const localDate = localDateOf(turn.startedAt)
     const safeId = safeTurnFileName(turn)
-    const rawRelPath = path.posix.join(
-      'projects',
-      context.workspaceId ?? 'orphan',
-      'turns',
-      localDate,
-      `${safeId}.md`,
-    )
-    const machineRelPath = path.posix.join(
-      'projects',
-      context.workspaceId ?? 'orphan',
-      'index',
-      `${localDate}.jsonl`,
-    )
+    const rawRelPath = path.posix.join('projects', workspaceId, 'turns', localDate, `${safeId}.md`)
+    const machineRelPath = path.posix.join('projects', workspaceId, 'index', `${localDate}.jsonl`)
 
     const markdown = renderTurnMarkdown(turn, this.config.wrapWidth)
     writeAtomic(path.join(this.config.mindRoot, rawRelPath), markdown)
@@ -104,10 +102,12 @@ export class CaptureWorker {
       bytes: byteLength(event.data),
     }))
 
+    const turnId = `${turn.sessionId}:${turn.turn}`
+    this.recent.set(turnId, turn)
     this.store.insertTurnAndJob(
       {
-        turnId: `${turn.sessionId}:${turn.turn}`,
-        workspaceId: context.workspaceId,
+        turnId,
+        workspaceId,
         sessionId: turn.sessionId,
         turnSeq: turn.turn,
         origin: turn.origin,
@@ -121,21 +121,129 @@ export class CaptureWorker {
     )
   }
 
-  private consumeJobs(): void {
+  private async consumeJobs(): Promise<void> {
     for (;;) {
       const job = this.store.claimJob(this.owner, this.config.leaseMs)
       if (job === null) return
-      try {
-        // Step 2: the raw turn is already durable. Summarization lands in Step 3.
+      const ok = await this.processJob(job)
+      if (!ok) return
+    }
+  }
+
+  private async processJob(job: ClaimedJob): Promise<boolean> {
+    try {
+      const row = this.store.getTurn(job.turnId)
+      if (row === undefined) {
+        this.store.completeJob(job.id)
+        return true
+      }
+
+      const workspaceId = String(row.workspace_id ?? 'orphan')
+      const localDate = String(row.local_date ?? '')
+      const rawRelPath = String(row.raw_rel_path ?? '')
+      const origin = String(row.origin ?? 'main')
+
+      // Subagent sessions are raw-only: never spawn a capture child from them.
+      if (origin === 'subagent' || this.summarize === undefined) {
+        this.rebuildViews(workspaceId, localDate, job.turnId, String(row.root_id ?? 'default'))
         this.store.completeJob(job.id)
         this.store.updateCaptureStatus(job.sessionId, { lastSeq: job.turnSeq, pending: 0, failed: 0 })
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error)
+        return true
+      }
+
+      const markdown = rawRelPath === '' ? '' : readSafe(path.join(this.config.mindRoot, rawRelPath))
+      const turn = this.turnForJob(job, row, origin)
+      const summary = await this.summarize(turn, markdown)
+      if (summary === null) {
         const dead = job.attempts >= this.config.maxAttempts
         const nextAt = new Date(Date.now() + retryDelayMs(job.attempts)).toISOString()
-        this.store.failJob(job.id, message, nextAt, dead)
-        this.store.updateCaptureStatus(job.sessionId, { failed: 1, lastError: message })
+        this.store.failJob(job.id, 'summary returned no valid JSON', nextAt, dead)
+        this.store.updateCaptureStatus(job.sessionId, { failed: 1, lastError: 'summary returned no valid JSON' })
+        return !dead
       }
+
+      this.recordSummary(job.turnId, summary, {
+        workspaceId,
+        localDate,
+        rawRelPath,
+        rootId: String(row.root_id ?? 'default'),
+        occurredAt: String(row.occurred_at ?? new Date().toISOString()),
+      })
+      this.rebuildViews(workspaceId, localDate, job.turnId, String(row.root_id ?? 'default'))
+      this.store.completeJob(job.id)
+      this.store.updateCaptureStatus(job.sessionId, { lastSeq: job.turnSeq, pending: 0, failed: 0 })
+      this.recent.delete(job.turnId)
+      return true
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const dead = job.attempts >= this.config.maxAttempts
+      const nextAt = new Date(Date.now() + retryDelayMs(job.attempts)).toISOString()
+      this.store.failJob(job.id, message, nextAt, dead)
+      this.store.updateCaptureStatus(job.sessionId, { failed: 1, lastError: message })
+      return false
+    }
+  }
+
+  private recordSummary(
+    turnId: string,
+    summary: TurnSummary,
+    meta: { workspaceId: string; localDate: string; rawRelPath: string; rootId: string; occurredAt: string },
+  ): void {
+    this.store.upsertTurnIndex({
+      turnId,
+      title: summary.title,
+      conclusion: summary.conclusion,
+      topics: summary.topics,
+      sourceRelPath: meta.rawRelPath,
+      rootId: meta.rootId,
+      occurredAt: meta.occurredAt,
+    })
+
+    for (const entry of summary.durable) {
+      if (entry.layer === 'project') {
+        this.store.upsertCognitionEntry({
+          id: `cog-${hash(`${turnId}:${entry.title}`)}`,
+          workspaceId: meta.workspaceId,
+          layer: 'project',
+          title: entry.title,
+          conclusion: entry.conclusion,
+          sourceRelPath: meta.rawRelPath,
+          rootId: meta.rootId,
+        })
+      } else {
+        this.store.insertProposal({
+          id: `prop-${hash(`${turnId}:${entry.title}`)}`,
+          workspaceId: meta.workspaceId,
+          layer: 'user',
+          title: entry.title,
+          content: entry.conclusion,
+          sourceTurn: turnId,
+        })
+      }
+    }
+  }
+
+  private rebuildViews(workspaceId: string, localDate: string, turnId: string, rootId: string): void {
+    if (localDate === '') return
+    rebuildDayIndex(this.store, this.config.mindRoot, workspaceId, localDate, rootId)
+    rebuildWeekIndex(this.store, this.config.mindRoot, workspaceId, localDate, rootId)
+    rebuildMonthIndex(this.store, this.config.mindRoot, workspaceId, localDate.slice(0, 7), rootId)
+    void turnId
+  }
+
+  private turnForJob(job: ClaimedJob, row: Record<string, unknown>, origin: string): CapturedTurn {
+    const cached = this.recent.get(job.turnId)
+    if (cached !== undefined) return cached
+    const startedAt = Date.parse(String(row.occurred_at ?? new Date().toISOString()))
+    return {
+      sessionId: String(row.session_id ?? job.sessionId),
+      turn: Number(row.turn_seq ?? job.turnSeq),
+      startedAt: Number.isFinite(startedAt) ? startedAt : Date.now(),
+      endedAt: Number.isFinite(startedAt) ? startedAt : Date.now(),
+      endReason: row.end_reason === null || row.end_reason === undefined ? null : String(row.end_reason),
+      origin: origin === 'subagent' ? 'subagent' : 'main',
+      workspacePath: null,
+      events: [],
     }
   }
 }
@@ -167,6 +275,18 @@ function byteLength(value: unknown): number {
 
 function retryDelayMs(attempts: number): number {
   return Math.min(5 * 60_000, 1_000 * 2 ** Math.min(attempts, 8))
+}
+
+function hash(value: string): string {
+  return crypto.createHash('sha1').update(value).digest('hex').slice(0, 16)
+}
+
+function readSafe(target: string): string {
+  try {
+    return fs.readFileSync(target, 'utf8')
+  } catch {
+    return ''
+  }
 }
 
 function writeAtomic(target: string, content: string): void {

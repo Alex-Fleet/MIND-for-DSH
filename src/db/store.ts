@@ -305,6 +305,211 @@ export class Store {
       )
   }
 
+  upsertTurnIndex(input: {
+    turnId: string
+    title: string
+    conclusion: string
+    topics: string[]
+    sourceRelPath: string | null
+    rootId: string
+    occurredAt: string
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO turn_index(turn_id, title, conclusion, topics_json, level, status, source_rel_path, root_id, occurred_at)
+         VALUES (?, ?, ?, ?, 'turn', 'current', ?, ?, ?)
+         ON CONFLICT(turn_id) DO UPDATE SET
+           title = excluded.title,
+           conclusion = excluded.conclusion,
+           topics_json = excluded.topics_json,
+           source_rel_path = excluded.source_rel_path,
+           root_id = excluded.root_id,
+           occurred_at = excluded.occurred_at`,
+      )
+      .run(
+        input.turnId,
+        input.title,
+        input.conclusion,
+        JSON.stringify(input.topics),
+        input.sourceRelPath,
+        input.rootId,
+        input.occurredAt,
+      )
+  }
+
+  getTurnIndex(turnId: string): Record<string, unknown> | undefined {
+    return this.db.prepare('SELECT * FROM turn_index WHERE turn_id = ?').get(turnId) as Record<string, unknown> | undefined
+  }
+
+  listTurnsForDay(workspaceId: string, localDate: string): Array<Record<string, unknown>> {
+    return this.db
+      .prepare(
+        `SELECT t.turn_id, t.session_id, t.turn_seq, t.origin, t.occurred_at, t.raw_rel_path,
+                ti.title, ti.conclusion
+         FROM turns t
+         LEFT JOIN turn_index ti ON ti.turn_id = t.turn_id
+         WHERE t.workspace_id = ? AND t.local_date = ?
+         ORDER BY t.occurred_at, t.turn_seq`,
+      )
+      .all(workspaceId, localDate) as Array<Record<string, unknown>>
+  }
+
+  upsertDayIndex(input: {
+    workspaceId: string
+    localDate: string
+    title: string
+    turnCount: number
+    reportRelPath: string
+    rootId: string
+    sourceTurnIds: string[]
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO day_index(workspace_id, local_date, title, turn_count, report_rel_path, root_id, source_turn_ids_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(workspace_id, local_date) DO UPDATE SET
+           title = excluded.title,
+           turn_count = excluded.turn_count,
+           report_rel_path = excluded.report_rel_path,
+           root_id = excluded.root_id,
+           source_turn_ids_json = excluded.source_turn_ids_json`,
+      )
+      .run(
+        input.workspaceId,
+        input.localDate,
+        input.title,
+        input.turnCount,
+        input.reportRelPath,
+        input.rootId,
+        JSON.stringify(input.sourceTurnIds),
+      )
+  }
+
+  listDaysInMonth(workspaceId: string, month: string): Array<Record<string, unknown>> {
+    return this.db
+      .prepare(
+        `SELECT * FROM day_index
+         WHERE workspace_id = ? AND local_date LIKE ?
+         ORDER BY local_date`,
+      )
+      .all(workspaceId, `${month}%`) as Array<Record<string, unknown>>
+  }
+
+  listDaysInRange(workspaceId: string, startDate: string, endDate: string): Array<Record<string, unknown>> {
+    return this.db
+      .prepare(
+        `SELECT * FROM day_index
+         WHERE workspace_id = ? AND local_date >= ? AND local_date <= ?
+         ORDER BY local_date`,
+      )
+      .all(workspaceId, startDate, endDate) as Array<Record<string, unknown>>
+  }
+
+  upsertPeriodIndex(input: {
+    workspaceId: string
+    kind: 'week' | 'month'
+    period: string
+    title: string
+    reportRelPath: string
+    rootId: string
+    sourceDayPaths: string[]
+    sourceTurnIds: string[]
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO period_index(workspace_id, kind, period, title, report_rel_path, root_id,
+                                  source_day_rel_paths_json, source_turn_ids_json, legacy_synthesized)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+         ON CONFLICT(workspace_id, kind, period) DO UPDATE SET
+           title = excluded.title,
+           report_rel_path = excluded.report_rel_path,
+           root_id = excluded.root_id,
+           source_day_rel_paths_json = excluded.source_day_rel_paths_json,
+           source_turn_ids_json = excluded.source_turn_ids_json`,
+      )
+      .run(
+        input.workspaceId,
+        input.kind,
+        input.period,
+        input.title,
+        input.reportRelPath,
+        input.rootId,
+        JSON.stringify(input.sourceDayPaths),
+        JSON.stringify(input.sourceTurnIds),
+      )
+  }
+
+  insertProposal(input: {
+    id: string
+    workspaceId: string | null
+    layer: 'user' | 'rule'
+    title: string
+    content: string
+    sourceTurn: string | null
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO memory_proposal(id, workspace_id, layer, title, content, status, source_turn, created_at)
+         VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+         ON CONFLICT(id) DO NOTHING`,
+      )
+      .run(input.id, input.workspaceId, input.layer, input.title, input.content, input.sourceTurn, nowIso())
+  }
+
+  upsertCognitionEntry(input: {
+    id: string
+    workspaceId: string | null
+    layer: 'project' | 'whiteboard' | 'user' | 'rule'
+    title: string
+    conclusion: string
+    sourceRelPath: string | null
+    rootId: string
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO cognition_entry(id, workspace_id, layer, title, conclusion, status, version, source_rel_path, root_id, updated_at)
+         VALUES (?, ?, ?, ?, ?, 'current', 1, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           title = excluded.title,
+           conclusion = excluded.conclusion,
+           status = 'current',
+           version = cognition_entry.version + 1,
+           source_rel_path = excluded.source_rel_path,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        input.id,
+        input.workspaceId,
+        input.layer,
+        input.title,
+        input.conclusion,
+        input.sourceRelPath,
+        input.rootId,
+        nowIso(),
+      )
+  }
+
+  listCognitionEntries(workspaceId: string, layer?: string): Array<Record<string, unknown>> {
+    if (layer === undefined) {
+      return this.db
+        .prepare(
+          "SELECT * FROM cognition_entry WHERE workspace_id = ? AND status = 'current' ORDER BY layer, updated_at DESC",
+        )
+        .all(workspaceId) as Array<Record<string, unknown>>
+    }
+    return this.db
+      .prepare(
+        "SELECT * FROM cognition_entry WHERE workspace_id = ? AND layer = ? AND status = 'current' ORDER BY updated_at DESC",
+      )
+      .all(workspaceId, layer) as Array<Record<string, unknown>>
+  }
+
+  listProposals(status = 'pending'): Array<Record<string, unknown>> {
+    return this.db
+      .prepare('SELECT * FROM memory_proposal WHERE status = ? ORDER BY created_at')
+      .all(status) as Array<Record<string, unknown>>
+  }
+
   countTurns(): number {
     return Number((this.db.prepare('SELECT COUNT(*) AS c FROM turns').get() as { c: number }).c)
   }

@@ -6,6 +6,7 @@ import { TurnBuffer, type EventLike, type SessionLike } from './capture/buffer.j
 import { CaptureWorker } from './capture/worker.js'
 import { resolveConfig, type MindConfig } from './config.js'
 import { Store } from './db/store.js'
+import { createLlmSummarizer } from './summarize/llm.js'
 import type { MindContext } from './types.js'
 
 export const name = 'mind-dsh'
@@ -30,11 +31,22 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
   store.ensureRoot(ROOT_ID, config.mindRoot)
 
   const buffer = new TurnBuffer()
-  const worker = new CaptureWorker(store, config)
+  const summarize = createLlmSummarizer({ ctx })
+  const worker = new CaptureWorker(store, config, summarize)
   const recovered = worker.reconcile()
   if (recovered > 0) {
     console.log(`[mind-dsh] recovered ${recovered} stale capture job(s)`)
   }
+
+  // A previous one-shot process may have exited with jobs still pending.
+  const kick = setTimeout(() => {
+    void worker.flush()
+  }, 500)
+  kick.unref()
+  const interval = setInterval(() => {
+    void worker.flush()
+  }, config.workerIntervalMs)
+  interval.unref()
 
   const c = ctx as MindContext
   c.systemPrompt.section({
@@ -54,13 +66,16 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
   })
 
   ctx.effect(() => () => {
+    clearTimeout(kick)
+    clearInterval(interval)
     const remaining = buffer.flushAll()
     for (const turn of remaining) {
       worker.enqueue(turn, { workspaceId: workspaceIdFor(turn.workspacePath), rootId: ROOT_ID })
     }
-    worker.flush()
-    worker.dispose()
-    store.close()
+    void worker.flush().finally(() => {
+      worker.dispose()
+      store.close()
+    })
   })
 
   console.log('[mind-dsh] loaded')
