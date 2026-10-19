@@ -1,5 +1,12 @@
 import type { Context } from '@deepseek-ai/cordis'
 
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /** Session event stream (DSH core). Payload shapes are narrowed at the call site. */
+    'session/event': (session: unknown, event: unknown) => void
+  }
+}
+
 /** A system-prompt section/context contribution, mirroring DSH's PromptContext. */
 export interface PromptContribution {
   name: string
