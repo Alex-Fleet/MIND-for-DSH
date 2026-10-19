@@ -48,7 +48,15 @@ export function createLlmSummarizer(options: LlmSummarizerOptions): SummarizeFn 
     }
 
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(new Error('mind summary timeout')), timeoutMs)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    // Hard deadline: abort alone is cooperative, and a provider that ignores
+    // the signal must not block the single drain loop forever.
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort(new Error('mind summary timeout'))
+        reject(new Error('mind summary timeout'))
+      }, timeoutMs)
+    })
     let text = ''
     try {
       const stream = llm.stream({
@@ -63,27 +71,50 @@ export function createLlmSummarizer(options: LlmSummarizerOptions): SummarizeFn 
         maxTokens,
         signal: controller.signal,
       })
-      for await (const chunk of stream) {
-        if (chunk.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
-      }
+      const consumed = (async (): Promise<string> => {
+        for await (const chunk of stream) {
+          if (chunk.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
+        }
+        return text
+      })()
+      // Mark the losing side handled if the deadline wins the race.
+      void consumed.catch(() => {})
+      text = await Promise.race([consumed, deadline])
       return parseSummary(text)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       console.warn(`[mind-dsh] summarizer failed: ${message}`)
       return null
     } finally {
-      clearTimeout(timer)
+      if (timer !== undefined) clearTimeout(timer)
     }
   }
 }
 
-/** Read the provider/model recorded on the turn's request context. */
+/** Read the provider/model recorded on the turn's request header/context. */
 export function detectModel(turn: CapturedTurn): { provider: string; model: string } | null {
+  if (typeof turn.provider === 'string' && typeof turn.model === 'string') {
+    return { provider: turn.provider, model: turn.model }
+  }
   for (const event of turn.events) {
-    if (event.type !== 'request/context') continue
+    if (event.type !== 'request/header' && event.type !== 'request/context') continue
     const data = event.data
     if (data === null || typeof data !== 'object') continue
     const record = data as Record<string, unknown>
+
+    // DSH 0.2.1: { header: { config: { provider, model, ... } } }
+    const header = record.header
+    if (header !== null && typeof header === 'object') {
+      const config = (header as Record<string, unknown>).config
+      if (config !== null && typeof config === 'object') {
+        const call = config as Record<string, unknown>
+        if (typeof call.provider === 'string' && typeof call.model === 'string') {
+          return { provider: call.provider, model: call.model }
+        }
+      }
+    }
+
+    // Older shape: provider/model directly on the event data.
     if (typeof record.provider === 'string' && typeof record.model === 'string') {
       return { provider: record.provider, model: record.model }
     }

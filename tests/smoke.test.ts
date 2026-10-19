@@ -22,6 +22,9 @@ function fakeContext() {
       listeners.push({ event, listener })
       return () => {}
     },
+    // Optional service injection: the fake has no `connection`, so UI routes
+    // stay unmounted.
+    inject: () => {},
     effect: (factory: () => () => void) => {
       cleanups.push(factory())
     },

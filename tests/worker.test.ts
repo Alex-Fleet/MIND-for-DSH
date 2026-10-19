@@ -68,6 +68,117 @@ describe('CaptureWorker', () => {
 
     const tooLong = content.split('\n').filter(line => line.length > 800)
     expect(tooLong).toHaveLength(0)
+
+    const eventsPath = rawPath.replace(/\.md$/, '.events.jsonl')
+    expect(fs.existsSync(eventsPath)).toBe(true)
+    expect(fs.readFileSync(eventsPath, 'utf8')).toContain('"type":"user/message"')
+    const row = store.getTurn('session-1:1')
+    expect(row?.raw_chars).toBe(content.length)
+    expect(row?.raw_events_rel_path).toBe(
+      path.relative(dir, eventsPath).split(path.sep).join('/'),
+    )
+
+    // The fallback index and day view exist before any LLM summary runs.
+    expect(store.getTurnIndex('session-1:1')?.status).toBe('unsummarized')
+    expect(store.getTurnIndex('session-1:1')?.title).toBe('hello')
+    expect(store.listDaysInMonth('ws1', localDateOf(finished.startedAt).slice(0, 7))).toHaveLength(1)
+
+    worker.dispose()
+    store.close()
+  })
+
+  it('ingests the same turn idempotently without duplicating events or JSONL', async () => {
+    const { dir, store, worker } = setup()
+    const buffer = new TurnBuffer()
+    buffer.push(session, { type: 'turn/start', time: Date.parse('2026-10-19T03:00:00Z'), data: { turn: 7 } })
+    buffer.push(session, {
+      type: 'user/message',
+      time: Date.parse('2026-10-19T03:00:01Z'),
+      data: { role: 'user', source: { kind: 'user' }, content: 'idempotent' },
+    })
+    const finished = buffer.push(session, {
+      type: 'turn/end',
+      time: Date.parse('2026-10-19T03:00:02Z'),
+      data: { turn: 7, reason: { kind: 'completed' } },
+    })!
+
+    worker.enqueue(finished, { workspaceId: 'ws1', rootId: 'default' })
+    worker.enqueue(finished, { workspaceId: 'ws1', rootId: 'default' })
+    await worker.flush()
+
+    expect(store.countTurns()).toBe(1)
+    expect(store.countTurnEvents('session-1:7')).toBe(finished.events.length)
+    const machine = path.join(dir, 'projects', 'ws1', 'index', `${localDateOf(finished.startedAt)}.jsonl`)
+    expect(fs.readFileSync(machine, 'utf8').trim().split('\n')).toHaveLength(1)
+    worker.dispose()
+    store.close()
+  })
+
+  it('does not write durable memory when the summary marks the turn as not worth remembering', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mind-dsh-worth-'))
+    cleanup.push(dir)
+    const config = resolveConfig({ mindRoot: dir })
+    const store = new Store(path.join(dir, 'mind.db'))
+    const worker = new CaptureWorker(store, config, async () => ({
+      title: 'greeting',
+      conclusion: 'hello',
+      topics: [],
+      durable: [{ layer: 'project', title: 'should not persist', conclusion: 'x' }],
+      worthRemembering: false,
+    }))
+    const buffer = new TurnBuffer()
+    buffer.push(session, { type: 'turn/start', time: Date.parse('2026-10-19T04:00:00Z'), data: { turn: 1 } })
+    buffer.push(session, {
+      type: 'user/message',
+      time: Date.parse('2026-10-19T04:00:01Z'),
+      data: { role: 'user', source: { kind: 'user' }, content: 'hi' },
+    })
+    const finished = buffer.push(session, {
+      type: 'turn/end',
+      time: Date.parse('2026-10-19T04:00:02Z'),
+      data: { turn: 1, reason: { kind: 'completed' } },
+    })!
+
+    worker.enqueue(finished, { workspaceId: 'ws1', rootId: 'default' })
+    await worker.flush()
+
+    expect(store.listCognitionEntries('ws1', 'project')).toHaveLength(0)
+    expect(store.listProposalsPage('pending', 10)).toHaveLength(0)
+    expect(store.getTurnIndex('session-1:1')?.status).toBe('current')
+    worker.dispose()
+    store.close()
+  })
+
+  it('keeps retrying a failed summary and keeps the turn visible', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mind-dsh-retry-'))
+    cleanup.push(dir)
+    const config = resolveConfig({ mindRoot: dir })
+    const store = new Store(path.join(dir, 'mind.db'))
+    const worker = new CaptureWorker(store, config, async () => null)
+    const buffer = new TurnBuffer()
+
+    buffer.push(session, { type: 'turn/start', time: Date.parse('2026-10-19T02:00:00Z'), data: { turn: 1 } })
+    buffer.push(session, {
+      type: 'user/message',
+      time: Date.parse('2026-10-19T02:00:01Z'),
+      data: { role: 'user', source: { kind: 'user' }, content: 'retry me' },
+    })
+    const finished = buffer.push(session, {
+      type: 'turn/end',
+      time: Date.parse('2026-10-19T02:00:02Z'),
+      data: { turn: 1, reason: { kind: 'completed' } },
+    })!
+
+    worker.enqueue(finished, { workspaceId: 'ws1', rootId: 'default' })
+    await worker.flush()
+
+    const jobs = store.listJobs('pending')
+    expect(jobs).toHaveLength(1)
+    expect(Number(jobs[0]?.attempts)).toBe(1)
+    expect(store.listJobs('dead')).toHaveLength(0)
+    expect(store.getTurnIndex('session-1:1')?.status).toBe('unsummarized')
+    expect(store.listDaysInMonth('ws1', localDateOf(finished.startedAt).slice(0, 7))).toHaveLength(1)
+
     worker.dispose()
     store.close()
   })

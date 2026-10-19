@@ -1,4 +1,5 @@
 import type { CapturedTurn } from '../capture/types.js'
+import { redactSecrets } from '../security/redact.js'
 
 export const SUMMARY_MAX_INPUT_CHARS = 30_000
 
@@ -10,10 +11,11 @@ export const SUMMARY_MAX_INPUT_CHARS = 30_000
  * and never produces prose outside the JSON object.
  */
 export function buildSummaryPrompt(turn: CapturedTurn, markdown: string): string {
+  const safe = redactSecrets(markdown)
   const body =
-    markdown.length > SUMMARY_MAX_INPUT_CHARS
-      ? `${markdown.slice(0, SUMMARY_MAX_INPUT_CHARS)}\n\n[内容过长已截断；完整原文见 ${turn.sessionId} turn #${turn.turn}]`
-      : markdown
+    safe.length > SUMMARY_MAX_INPUT_CHARS
+      ? `${safe.slice(0, SUMMARY_MAX_INPUT_CHARS)}\n\n[内容过长已截断；完整原文见 ${turn.sessionId} turn #${turn.turn}]`
+      : safe
 
   return [
     '你是 MIND 的记忆整合器。阅读下面这一轮的原始记录，生成一条可导航的索引。',

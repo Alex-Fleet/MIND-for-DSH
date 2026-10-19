@@ -5,14 +5,16 @@ import type { Context } from '@deepseek-ai/cordis'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { TurnBuffer, type EventLike, type SessionLike } from './capture/buffer.js'
 import { CaptureWorker, localDateOf } from './capture/worker.js'
-import { resolveConfig, type MindConfig } from './config.js'
+import { loadPersistedSettings, resolveConfig, savePersistedSettings, type MindConfig } from './config.js'
 import { Store } from './db/store.js'
 import { resolveWorkspace } from './identity/workspace.js'
+import { findOpenTurn } from './recovery/open-turn.js'
 import { buildIncrement } from './inject/increment.js'
 import { buildSnapshot } from './inject/snapshot.js'
 import { createStandardsProvider } from './inject/standards.js'
 import { createLlmSummarizer } from './summarize/llm.js'
 import { registerMindTools } from './tools/mind-tools.js'
+import { registerUiRoutes } from './ui/routes.js'
 import type { MindContext } from './types.js'
 
 export const name = 'mind-dsh'
@@ -41,7 +43,18 @@ type PreStepDecision =
  */
 export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
   const config = resolveConfig(rawConfig)
-  fs.mkdirSync(config.mindRoot, { recursive: true })
+  fs.mkdirSync(config.mindRoot, { recursive: true, mode: 0o700 })
+  try {
+    fs.chmodSync(config.mindRoot, 0o700)
+  } catch {
+    // A read-only or exotic filesystem may refuse chmod; do not block capture.
+  }
+
+  // The Settings page owns two switches. Persisted values win over the
+  // profile config so a UI toggle survives a restart.
+  const persisted = loadPersistedSettings(config.mindRoot)
+  if (persisted.captureEnabled !== undefined) config.captureEnabled = persisted.captureEnabled
+  if (persisted.injectEnabled !== undefined) config.injectEnabled = persisted.injectEnabled
 
   const store = new Store(path.join(config.mindRoot, 'mind.db'))
   store.ensureRoot(ROOT_ID, config.mindRoot)
@@ -57,36 +70,76 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
   if (recovered > 0) {
     console.log(`[mind-dsh] recovered ${recovered} stale capture job(s)`)
   }
+  const retried = store.requeueSummaryFailures()
+  if (retried > 0) {
+    console.log(`[mind-dsh] requeued ${retried} retryable summary job(s)`)
+  }
+  const reconciled = worker.reconcileRawTurns()
+  if (reconciled > 0) {
+    console.log(`[mind-dsh] reconciled ${reconciled} orphan raw turn(s)`)
+  }
+  const backfilled = worker.backfillIndexes()
+  if (backfilled > 0) {
+    console.log(`[mind-dsh] backfilled ${backfilled} turn index(es)`)
+  }
+  const rebuilt = worker.rebuildMissingViews()
+  if (rebuilt > 0) {
+    console.log(`[mind-dsh] rebuilt ${rebuilt} stale day view(s)`)
+  }
 
   const kick = setTimeout(() => {
     void worker.flush()
   }, 500)
   kick.unref()
   const interval = setInterval(() => {
+    // A restart inside the lease window would otherwise leave a job running
+    // until the next restart; recover it as soon as the lease expires.
+    const recoveredNow = store.recoverStaleJobs()
+    if (recoveredNow > 0) {
+      console.log(`[mind-dsh] recovered ${recoveredNow} expired capture job(s)`)
+    }
     void worker.flush()
   }, config.workerIntervalMs)
   interval.unref()
 
   let currentWorkspaceId: string | null = null
   let currentWorkspacePath: string | null = null
-  let currentCwd: string | null = null
+  const workspaceBySession = new Map<string, { cwd: string; id: string | null; path: string | null }>()
   const lastIncrement = new Map<string, string>()
 
-  function ensureWorkspace(cwd: string | null): string | null {
+  /**
+   * Per-session cache: two sessions in different cwds must not resolve the
+   * workspace on every alternating event.
+   */
+  function ensureWorkspace(sessionId: string, cwd: string | null): string | null {
     if (cwd === null || cwd === '') return currentWorkspaceId
-    if (cwd === currentCwd) return currentWorkspaceId
-    currentCwd = cwd
+    const cached = workspaceBySession.get(sessionId)
+    if (cached !== undefined && cached.cwd === cwd) {
+      currentWorkspaceId = cached.id
+      currentWorkspacePath = cached.path
+      return cached.id
+    }
+    let id: string | null
+    let resolvedPath: string | null
     try {
       const resolved = resolveWorkspace(store, cwd)
-      currentWorkspaceId = resolved.workspaceId
-      currentWorkspacePath = resolved.workspacePath
+      id = resolved.workspaceId
+      resolvedPath = resolved.workspacePath
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       console.warn(`[mind-dsh] workspace resolve failed: ${message}`)
-      currentWorkspaceId = workspaceIdFor(cwd)
-      currentWorkspacePath = cwd
+      id = workspaceIdFor(cwd)
+      resolvedPath = cwd
     }
-    return currentWorkspaceId
+    workspaceBySession.set(sessionId, { cwd, id, path: resolvedPath })
+    while (workspaceBySession.size > 500) {
+      const oldest = workspaceBySession.keys().next().value
+      if (oldest === undefined) break
+      workspaceBySession.delete(oldest)
+    }
+    currentWorkspaceId = id
+    currentWorkspacePath = resolvedPath
+    return id
   }
 
   const c = ctx as MindContext
@@ -94,29 +147,67 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
   c.systemPrompt.section({
     name: 'mind-dsh:static',
     order: c.systemPrompt.getSectionOrder('TOOL_SESSION_QUERY'),
-    text: () => standards(),
+    text: () => (config.injectEnabled ? standards() : ''),
   })
 
   c.systemPrompt.context({
     name: 'mind-dsh:snapshot',
     order: 1000,
-    text: () =>
-      buildSnapshot({
+    text: (context: unknown) => {
+      if (!config.injectEnabled) return ''
+      // The assembly context carries the current agent; use its session/cwd
+      // instead of a process-global "last workspace", which can leak across
+      // concurrent sessions.
+      const agent = (
+        context as {
+          agent?: { id?: string; session?: { header?: { cwd?: string } } }
+        }
+      ).agent
+      const sessionId = typeof agent?.id === 'string' ? agent.id : 'unknown'
+      const cwd = agent?.session?.header?.cwd ?? null
+      const workspaceId = ensureWorkspace(sessionId, cwd) ?? currentWorkspaceId ?? 'orphan'
+      return buildSnapshot({
         store,
-        workspaceId: currentWorkspaceId ?? 'orphan',
+        workspaceId,
         rootPath: config.mindRoot,
         localDate: localDateOf(Date.now(), config.dayBoundaryMinutes),
         dayBoundaryMinutes: config.dayBoundaryMinutes,
-      }),
+      })
+    },
   })
 
   registerMindTools(c.tools, store, config.mindRoot)
+
+  // Recover turns that were open when the previous process died. DSH's
+  // persisted session log is the source of truth; the live buffer alone
+  // would lose the turn. This runs only after the plugin is active, and
+  // skips turns already present in MIND.
+  ctx.inject(['sessionPersistence'], child => {
+    void recoverInterruptedTurns(
+      child as unknown as { sessionPersistence: SessionPersistenceLike; get?: (name: string) => unknown },
+      store,
+      worker,
+    ).catch(error => {
+      const message = error instanceof Error ? error.message : String(error)
+      console.warn(`[mind-dsh] interrupted-turn recovery failed: ${message}`)
+    })
+  })
+
+  registerUiRoutes(
+    ctx,
+    {
+      store,
+      config,
+      saveSettings: settings => savePersistedSettings(config.mindRoot, settings),
+    },
+    config.uiEnabled,
+  )
 
   ctx.on(
     'session/event',
     ((sessionRaw: unknown, eventRaw: unknown) => {
       const session = sessionRaw as SessionLike
-      const workspaceId = ensureWorkspace(session.header?.cwd ?? null)
+      const workspaceId = ensureWorkspace(String(session.id ?? 'unknown'), session.header?.cwd ?? null)
       if (!config.captureEnabled) return
       const finished = buffer.push(session, eventRaw as EventLike)
       if (finished === null) return
@@ -132,11 +223,16 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
     (async (payload: unknown, next: () => Promise<unknown>): Promise<PreStepDecision> => {
       const downstream = (await next()) as PreStepDecision
       if (downstream.kind !== 'enter') return downstream
+      if (!config.injectEnabled) return downstream
 
       const input = payload as PreStepPayload
       if (input.step !== 1) return downstream
 
-      const workspaceId = ensureWorkspace(input.agent?.session?.header?.cwd ?? null) ?? currentWorkspaceId
+      const workspaceId =
+        ensureWorkspace(
+          String(input.agent?.session?.id ?? 'unknown'),
+          input.agent?.session?.header?.cwd ?? null,
+        ) ?? currentWorkspaceId
       if (workspaceId === null) return downstream
 
       const increment = buildIncrement(store, workspaceId, localDateOf(Date.now(), config.dayBoundaryMinutes))
@@ -169,6 +265,129 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
   })
 
   console.log('[mind-dsh] loaded')
+}
+
+interface PersistedSessionRecord {
+  header: {
+    id: string
+    cwd?: string
+    origin?: string
+    delegationDepth?: number
+  }
+  eventCount?: number
+  live?: boolean
+}
+
+interface SessionEventLike {
+  type: string
+  seq: number
+  time?: number
+  data?: unknown
+}
+
+interface SessionHandleLike {
+  read(offset?: number): Promise<{ events: readonly SessionEventLike[] }>
+  close(): Promise<void>
+}
+
+interface SessionPersistenceLike {
+  list(options?: unknown): Promise<readonly PersistedSessionRecord[]>
+  stat?(id: string, options?: unknown): Promise<{ eventCount?: number } | undefined>
+  open(id: string, mode: 'read' | 'write', options?: unknown): Promise<SessionHandleLike>
+}
+
+async function recoverInterruptedTurns(
+  host: { sessionPersistence: SessionPersistenceLike; get?: (name: string) => unknown },
+  store: Store,
+  worker: CaptureWorker,
+): Promise<void> {
+  const persistence = host.sessionPersistence
+  const agents = host.get?.('agents') as { get?: (id: string) => unknown } | undefined
+  let records: readonly PersistedSessionRecord[]
+  try {
+    records = await persistence.list()
+  } catch {
+    return
+  }
+
+  let recovered = 0
+  for (const record of records.slice(0, 200)) {
+    const sessionId = record.header.id
+    if (sessionId === '') continue
+    if (record.live === true) continue
+    if (agents?.get?.(sessionId) !== undefined) continue
+
+    const eventCount = Number(record.eventCount ?? 0)
+    let tail: readonly SessionEventLike[] = []
+    try {
+      const handle = await persistence.open(sessionId, 'read')
+      try {
+        tail = (await handle.read(Math.max(0, eventCount - 50))).events
+      } finally {
+        await handle.close()
+      }
+    } catch {
+      continue
+    }
+    const last = tail[tail.length - 1]
+    if (last !== undefined && last.type === 'turn/end') continue
+
+    // The tail is empty or does not end in turn/end: read the complete log to
+    // find the turn/start (a long turn may start more than 50 events back).
+    let all: readonly SessionEventLike[] = []
+    try {
+      const handle = await persistence.open(sessionId, 'read')
+      try {
+        all = (await handle.read(0)).events
+      } finally {
+        await handle.close()
+      }
+    } catch {
+      continue
+    }
+
+    const openTurn = findOpenTurn(all)
+    if (openTurn === null) continue
+    const { turn, startSeq } = openTurn
+    const turnId = `${sessionId}:${turn}`
+    if (store.getTurn(turnId) !== undefined) continue
+
+    const events = all
+      .filter(event => event.seq >= startSeq)
+      .map(event => ({
+        type: event.type,
+        seq: event.seq,
+        occurredAt: typeof event.time === 'number' ? event.time : Date.now(),
+        data: event.data,
+      }))
+    const startedAt = events[0]?.occurredAt ?? Date.now()
+    const cwd = record.header.cwd ?? null
+    let workspaceId: string | null = null
+    if (cwd !== null && cwd !== '') {
+      try {
+        workspaceId = resolveWorkspace(store, cwd).workspaceId
+      } catch {
+        workspaceId = workspaceIdFor(cwd)
+      }
+    }
+    worker.enqueue(
+      {
+        sessionId,
+        turn,
+        startedAt,
+        endedAt: events.at(-1)?.occurredAt ?? startedAt,
+        endReason: 'interrupted',
+        origin: record.header.origin === 'subagent' ? 'subagent' : 'main',
+        workspacePath: cwd,
+        events,
+      },
+      { workspaceId: workspaceId ?? 'orphan', rootId: ROOT_ID },
+    )
+    recovered += 1
+  }
+  if (recovered > 0) {
+    console.log(`[mind-dsh] recovered ${recovered} interrupted turn(s) from session logs`)
+  }
 }
 
 /** Stable path-derived workspace id until Step 5 adds inode identity. */

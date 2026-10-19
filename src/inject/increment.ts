@@ -1,4 +1,6 @@
 import type { Store } from '../db/store.js'
+import { beijingTimeOf } from '../time.js'
+import { redactSecrets } from '../security/redact.js'
 
 /**
  * One-line "what just happened" increment for the current turn.
@@ -7,13 +9,12 @@ import type { Store } from '../db/store.js'
  * user batch once per turn instead of forcing the whole snapshot to change.
  */
 export function buildIncrement(store: Store, workspaceId: string, localDate: string): string | null {
-  const rows = store.listTurnsForDay(workspaceId, localDate)
-  if (rows.length === 0) return null
-  const last = rows[rows.length - 1]
+  // Subagent turns are raw-only; only main turns form the per-turn increment.
+  const last = store.getLastMainTurn(workspaceId, localDate)
   if (last === undefined) return null
 
-  const time = String(last.occurred_at ?? '').slice(11, 16)
+  const time = beijingTimeOf(String(last.occurred_at ?? ''))
   const title = String(last.title ?? '(未摘要)')
   const rawPath = String(last.raw_rel_path ?? '')
-  return `[MIND] ${time} ${title}${rawPath === '' ? '' : ` · ${rawPath}`}`.slice(0, 200)
+  return redactSecrets(`[MIND] ${time} ${title}${rawPath === '' ? '' : ` · ${rawPath}`}`).slice(0, 200)
 }

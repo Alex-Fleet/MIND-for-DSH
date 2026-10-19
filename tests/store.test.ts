@@ -27,6 +27,8 @@ const turn = {
   localDate: '2026-10-19',
   rootId: 'default',
   rawRelPath: 'projects/ws1/turns/2026-10-19/s1--turn-1.md',
+  provider: null,
+  model: null,
 }
 
 describe('Store', () => {
@@ -64,15 +66,36 @@ describe('Store', () => {
     store.close()
   })
 
-  it('fails a job back to pending and then to dead', () => {
+  it('reschedules a failed job forever instead of marking it dead', () => {
     const store = tempStore()
     store.insertTurnAndJob(turn, [])
     const job = store.claimJob('owner', 60_000)!
-    store.failJob(job.id, 'boom', '2000-01-01T00:00:00.000Z', false)
+    store.failJob(job.id, 'boom', '2000-01-01T00:00:00.000Z')
     expect(store.listJobs('pending')).toHaveLength(1)
+    expect(store.listJobs('dead')).toHaveLength(0)
     const retry = store.claimJob('owner', 60_000)!
-    store.failJob(retry.id, 'boom', '2000-01-01T00:00:00.000Z', true)
-    expect(store.listJobs('dead')).toHaveLength(1)
+    store.failJob(retry.id, 'boom', '2000-01-01T00:00:00.000Z')
+    expect(store.listJobs('pending')).toHaveLength(1)
+    expect(store.listJobs('dead')).toHaveLength(0)
+    store.close()
+  })
+
+  it('lists turns without an index and records the fallback status', () => {
+    const store = tempStore()
+    store.insertTurnAndJob(turn, [])
+    expect(store.listMissingTurnIndexes(10)).toHaveLength(1)
+    store.upsertTurnIndex({
+      turnId: 's1:1',
+      title: 'hello',
+      conclusion: '',
+      topics: [],
+      status: 'unsummarized',
+      sourceRelPath: turn.rawRelPath,
+      rootId: 'default',
+      occurredAt: turn.occurredAt,
+    })
+    expect(store.listMissingTurnIndexes(10)).toHaveLength(0)
+    expect(store.getTurnIndex('s1:1')?.status).toBe('unsummarized')
     store.close()
   })
 
@@ -93,6 +116,71 @@ describe('Store', () => {
     expect(rows).toHaveLength(1)
     expect(rows[0]?.title).toBe('修复注入超时')
     expect(store.searchTurnIndex('不存在的词', 10)).toHaveLength(0)
+    store.close()
+  })
+
+  it('commits turn, events, job and fallback index atomically and idempotently', () => {
+    const store = tempStore()
+    const events = [
+      { kind: 'user/message', seq: 1, toolName: null, bytes: 10 },
+      { kind: 'assistant/message', seq: 2, toolName: null, bytes: 20 },
+    ]
+    const index = {
+      title: 'hello',
+      conclusion: '',
+      topics: [],
+      status: 'unsummarized' as const,
+      sourceRelPath: turn.rawRelPath,
+      rootId: 'default',
+      occurredAt: turn.occurredAt,
+    }
+    store.ingestTurn(turn, events, index)
+    store.ingestTurn(turn, events, index)
+
+    expect(store.countTurns()).toBe(1)
+    expect(store.countTurnEvents('s1:1')).toBe(2)
+    expect(store.listJobs('pending')).toHaveLength(1)
+    expect(store.getTurnIndex('s1:1')?.title).toBe('hello')
+    store.close()
+  })
+
+  it('rolls back the whole ingest when an event insert fails', () => {
+    const store = tempStore()
+    const bad = [{ kind: null as unknown as string, seq: null, toolName: null, bytes: 0 }]
+    const index = {
+      title: 'hello',
+      conclusion: '',
+      topics: [],
+      status: 'unsummarized' as const,
+      sourceRelPath: turn.rawRelPath,
+      rootId: 'default',
+      occurredAt: turn.occurredAt,
+    }
+    expect(() => store.ingestTurn(turn, bad, index)).toThrow()
+    expect(store.getTurn('s1:1')).toBeUndefined()
+    expect(store.countTurnEvents('s1:1')).toBe(0)
+    expect(store.listJobs('pending')).toHaveLength(0)
+    expect(store.getTurnIndex('s1:1')).toBeUndefined()
+    store.close()
+  })
+
+  it('does not bump a cognition version when the content is unchanged', () => {
+    const store = tempStore()
+    const base = {
+      id: 'rule-1',
+      workspaceId: 'ws1',
+      layer: 'rule' as const,
+      title: 'rule',
+      conclusion: 'content',
+      sourceRelPath: null,
+      rootId: 'default',
+    }
+    store.upsertCognitionEntry(base)
+    const first = store.getCognitionEntry('rule-1')?.version
+    store.upsertCognitionEntry(base)
+    expect(store.getCognitionEntry('rule-1')?.version).toBe(first)
+    store.upsertCognitionEntry({ ...base, conclusion: 'changed' })
+    expect(store.getCognitionEntry('rule-1')?.version).toBe(Number(first) + 1)
     store.close()
   })
 

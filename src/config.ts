@@ -1,3 +1,4 @@
+import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -9,7 +10,7 @@ export interface MindConfig {
   uiEnabled?: boolean
   /** How often the capture worker drains pending jobs. */
   workerIntervalMs?: number
-  /** Maximum attempts before a job becomes dead. */
+  /** Fast retries before the steady 30-minute summary retry cadence. */
   maxAttempts?: number
   /** Lease duration for a claimed job. */
   leaseMs?: number
@@ -33,7 +34,7 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   uiEnabled: true,
   workerIntervalMs: 2000,
   maxAttempts: 5,
-  leaseMs: 60_000,
+  leaseMs: 300_000,
   wrapWidth: 800,
   standardsDir: '',
   dayBoundaryMinutes: 240,
@@ -60,4 +61,39 @@ export function resolveConfig(config: MindConfig = {}): ResolvedConfig {
         ? path.resolve(config.standardsDir)
         : path.join(mindRoot, 'global', 'standards'),
   }
+}
+
+/** The two toggles the Settings page owns. */
+export interface PersistedSettings {
+  captureEnabled?: boolean
+  injectEnabled?: boolean
+}
+
+/**
+ * Read the UI-owned settings file. This is deliberately separate from the
+ * Cordis config: a missing or malformed file means "no overrides", never a
+ * load failure.
+ */
+export function loadPersistedSettings(mindRoot: string): PersistedSettings {
+  try {
+    const raw = fs.readFileSync(path.join(mindRoot, 'settings.json'), 'utf8')
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const record = parsed as Record<string, unknown>
+    const settings: PersistedSettings = {}
+    if (typeof record.captureEnabled === 'boolean') settings.captureEnabled = record.captureEnabled
+    if (typeof record.injectEnabled === 'boolean') settings.injectEnabled = record.injectEnabled
+    return settings
+  } catch {
+    return {}
+  }
+}
+
+/** Atomically persist the UI-owned settings. */
+export function savePersistedSettings(mindRoot: string, settings: PersistedSettings): void {
+  fs.mkdirSync(mindRoot, { recursive: true })
+  const target = path.join(mindRoot, 'settings.json')
+  const temp = `${target}.tmp-${process.pid}-${Date.now()}`
+  fs.writeFileSync(temp, `${JSON.stringify(settings, null, 2)}\n`, 'utf8')
+  fs.renameSync(temp, target)
 }

@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import type { Store } from '../db/store.js'
+import { beijingTimeOf } from '../time.js'
 
 export interface DayView {
   reportRelPath: string
@@ -41,7 +42,7 @@ export function rebuildDayIndex(
   }
   lines.push('', '## 条目')
   for (const row of rows) {
-    const time = String(row.occurred_at ?? '').slice(11, 16)
+    const time = beijingTimeOf(String(row.occurred_at ?? ''))
     const rowTitle = String(row.title ?? '(未摘要)')
     const conclusion = String(row.conclusion ?? '')
     const rawPath = String(row.raw_rel_path ?? '')

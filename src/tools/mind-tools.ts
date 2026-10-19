@@ -1,7 +1,7 @@
-import fs from 'node:fs'
-import path from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Store } from '../db/store.js'
+import { redactSecrets } from '../security/redact.js'
+import { readTurnChunk } from '../turns/read.js'
 
 interface ToolRegistry {
   register(definition: unknown): void
@@ -34,18 +34,11 @@ export function registerMindTools(tools: ToolRegistry, store: Store, mindRoot: s
       timeoutMs: 15_000,
       execute: async args => {
         const input = args as { turn_id: string; offset_chars?: number; max_chars?: number }
-        const row = store.getTurn(input.turn_id)
-        if (row === undefined) throw new Error(`turn not found: ${input.turn_id}`)
-        const relative = String(row.raw_rel_path ?? '')
-        if (relative === '') throw new Error(`turn has no readable raw file: ${input.turn_id}`)
-
-        const full = fs.readFileSync(path.join(mindRoot, relative), 'utf8')
-        const offset = Math.max(0, Math.floor(input.offset_chars ?? 0))
-        const maxChars = Math.min(100_000, Math.max(1, Math.floor(input.max_chars ?? 20_000)))
-        const chunk = full.slice(offset, offset + maxChars)
-        const next = offset + chunk.length
-        const nextLabel = next < full.length ? String(next) : 'end'
-        return `[turn ${input.turn_id}] offset=${offset} total=${full.length} next=${nextLabel}\n\n${chunk}`
+        const read = readTurnChunk(store, mindRoot, input.turn_id, input.offset_chars, input.max_chars)
+        const nextLabel = read.next === null ? 'end' : String(read.next)
+        return redactSecrets(
+          `[turn ${read.turnId}] offset=${read.offset} total=${read.total} next=${nextLabel}\n\n${read.chunk}`,
+        )
       },
     }),
   )
@@ -72,7 +65,7 @@ export function registerMindTools(tools: ToolRegistry, store: Store, mindRoot: s
             `- ${String(row.turn_id)} · ${String(row.title ?? '')} · ${String(row.conclusion ?? '')} · ${String(row.source_rel_path ?? '')}`,
           )
         }
-        return lines.join('\n')
+        return redactSecrets(lines.join('\n'))
       },
     }),
   )

@@ -13,5 +13,8 @@ export interface CapturedTurn {
   endReason: string | null
   origin: 'main' | 'subagent'
   workspacePath: string | null
+  /** Provider/model used by the turn, when known at capture time. */
+  provider?: string | null
+  model?: string | null
   events: CapturedEvent[]
 }

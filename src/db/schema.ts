@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 4
 
 /**
  * One idempotent schema block. Every statement uses IF NOT EXISTS so a fresh
@@ -63,6 +63,10 @@ CREATE TABLE IF NOT EXISTS turns (
   local_date TEXT NOT NULL,
   root_id TEXT,
   raw_rel_path TEXT,
+  raw_events_rel_path TEXT,
+  raw_chars INTEGER,
+  provider TEXT,
+  model TEXT,
   created_at TEXT NOT NULL,
   UNIQUE(session_id, turn_seq)
 );
@@ -178,6 +182,7 @@ CREATE TABLE IF NOT EXISTS cognition_entry (
   title TEXT,
   conclusion TEXT,
   status TEXT NOT NULL DEFAULT 'current',
+  enabled INTEGER NOT NULL DEFAULT 1,
   version INTEGER NOT NULL DEFAULT 1,
   source_rel_path TEXT,
   root_id TEXT,
@@ -199,5 +204,8 @@ CREATE TABLE IF NOT EXISTS memory_proposal (
   created_at TEXT NOT NULL
 );
 
-PRAGMA user_version = ${SCHEMA_VERSION};
+CREATE TABLE IF NOT EXISTS app_setting (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 `
