@@ -120,6 +120,17 @@ export class Store {
       if (!this.hasColumn('turns', 'raw_chars')) {
         this.db.exec('ALTER TABLE turns ADD COLUMN raw_chars INTEGER')
       }
+      // Rules-only migration: old user rules become project rules, and the
+      // retired project/whiteboard layers keep their rows but stop being
+      // current (so they are neither shown nor injected).
+      if (this.getSetting('legacy_layers_migrated_v1') !== '1') {
+        this.db.exec(
+          `UPDATE cognition_entry SET layer = 'rule' WHERE layer = 'user';
+           UPDATE cognition_entry SET status = 'retired'
+             WHERE layer IN ('project', 'whiteboard');`,
+        )
+        this.setSetting('legacy_layers_migrated_v1', '1')
+      }
       this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
     })
   }
@@ -334,10 +345,11 @@ export class Store {
     return this.tx(() => {
       const row = this.db
         .prepare(
-          `SELECT id, turn_id, session_id, turn_seq, workspace_id, attempts
-           FROM capture_job
-           WHERE state = 'pending' AND next_at <= ?
-           ORDER BY id LIMIT 1`,
+          `SELECT cj.id, cj.turn_id, cj.session_id, cj.turn_seq, cj.workspace_id, cj.attempts
+           FROM capture_job cj
+           LEFT JOIN turns t ON t.turn_id = cj.turn_id
+           WHERE cj.state = 'pending' AND cj.next_at <= ?
+           ORDER BY COALESCE(t.occurred_at, '') DESC, cj.id DESC LIMIT 1`,
         )
         .get(now) as
         | { id: number; turn_id: string; session_id: string; turn_seq: number; workspace_id: string | null; attempts: number }
@@ -381,12 +393,20 @@ export class Store {
    * the provider/model columns, so they are included; the summarizer falls
    * back to its configured/default model.
    */
+  /**
+   * Re-arm failed summary jobs, but only for turns genuinely waiting for a
+   * summary (`unsummarized`). Migrated turns whose legacy summary was
+   * `invalid`/`merged` stay untouched: they were never meant to be
+   * re-summarized (user decision, 2026-10-24), and re-arming them would burn a
+   * model call per noise turn on every restart.
+   */
   requeueSummaryFailures(now = nowIso()): number {
     const result = this.db
       .prepare(
         `UPDATE capture_job
          SET state = 'pending', attempts = 0, next_at = ?, owner = NULL, lease_until = NULL, last_error = NULL
-         WHERE state IN ('dead', 'failed')`,
+         WHERE state IN ('dead', 'failed')
+           AND turn_id IN (SELECT turn_id FROM turn_index WHERE status = 'unsummarized')`,
       )
       .run(now)
     return Number(result.changes)
@@ -543,6 +563,8 @@ export class Store {
          FROM turns t
          LEFT JOIN day_index d ON d.workspace_id = t.workspace_id AND d.local_date = t.local_date
          WHERE d.local_date IS NULL
+            OR d.report_rel_path IS NULL
+            OR d.report_rel_path = ''
             OR d.turn_count != (SELECT COUNT(*) FROM turns t2
                                 WHERE t2.workspace_id = t.workspace_id AND t2.local_date = t.local_date)
          GROUP BY t.workspace_id, t.local_date
@@ -567,6 +589,22 @@ export class Store {
 
   getTurnIndex(turnId: string): Record<string, unknown> | undefined {
     return this.db.prepare('SELECT * FROM turn_index WHERE turn_id = ?').get(turnId) as Record<string, unknown> | undefined
+  }
+
+  /**
+   * Mark a fallback index as "not summarized yet". Used by the explicit
+   * `summarizeEnabled=false` degradation path: the turn keeps its preview so
+   * the timeline and FTS still show it, and re-enabling summarization picks it
+   * up again. Never demotes `current`.
+   *
+   * Migrated turns whose legacy summary was `invalid`/`merged` keep the
+   * distinct `invalid` status written by the migration, which is never
+   * re-queued.
+   */
+  markTurnIndexUnsummarized(turnId: string): void {
+    this.db
+      .prepare("UPDATE turn_index SET status = 'unsummarized' WHERE turn_id = ? AND status != 'current'")
+      .run(turnId)
   }
 
   listTurnsForDay(workspaceId: string, localDate: string, limit?: number): Array<Record<string, unknown>> {
@@ -633,6 +671,31 @@ export class Store {
       .all(workspaceId, beforeDate, limit) as Array<Record<string, unknown>>
   }
 
+  getDayIndex(workspaceId: string, localDate: string): Record<string, unknown> | undefined {
+    return this.db
+      .prepare('SELECT * FROM day_index WHERE workspace_id = ? AND local_date = ?')
+      .get(workspaceId, localDate) as Record<string, unknown> | undefined
+  }
+
+  /** Every turn index belonging to one workspace in [sinceIso, beforeIso). */
+  listRecentTurnIndexes(
+    workspaceId: string,
+    sinceIso: string,
+    beforeIso?: string,
+  ): Array<Record<string, unknown>> {
+    const before = beforeIso === undefined ? '' : ' AND occurred_at < ?'
+    const params = [`projects/${workspaceId}/turns/%`, sinceIso]
+    if (beforeIso !== undefined) params.push(beforeIso)
+    return this.db
+      .prepare(
+        `SELECT * FROM turn_index
+         WHERE source_rel_path LIKE ? AND occurred_at >= ?${before}
+           AND status = 'current'
+         ORDER BY occurred_at DESC`,
+      )
+      .all(...params) as Array<Record<string, unknown>>
+  }
+
   listDaysInRange(workspaceId: string, startDate: string, endDate: string): Array<Record<string, unknown>> {
     return this.db
       .prepare(
@@ -641,6 +704,53 @@ export class Store {
          ORDER BY local_date`,
       )
       .all(workspaceId, startDate, endDate) as Array<Record<string, unknown>>
+  }
+
+  /** Day rows in [startDate, endDateExclusive), newest first. */
+  listDaysBetween(
+    workspaceId: string,
+    startDate: string,
+    endDateExclusive: string,
+  ): Array<Record<string, unknown>> {
+    return this.db
+      .prepare(
+        `SELECT * FROM day_index
+         WHERE workspace_id = ? AND local_date >= ? AND local_date < ?
+         ORDER BY local_date DESC`,
+      )
+      .all(workspaceId, startDate, endDateExclusive) as Array<Record<string, unknown>>
+  }
+
+  /** Newest-first period reports (week/month) for one workspace. */
+  listPeriods(workspaceId: string, kind: 'week' | 'month', limit = 200): Array<Record<string, unknown>> {
+    return this.db
+      .prepare(
+        `SELECT * FROM period_index
+         WHERE workspace_id = ? AND kind = ?
+         ORDER BY period DESC LIMIT ?`,
+      )
+      .all(workspaceId, kind, limit) as Array<Record<string, unknown>>
+  }
+
+  /** Every period report of one kind, newest first. */
+  listAllPeriods(workspaceId: string, kind: 'week' | 'month'): Array<Record<string, unknown>> {
+    return this.db
+      .prepare(
+        `SELECT * FROM period_index
+         WHERE workspace_id = ? AND kind = ?
+         ORDER BY period DESC`,
+      )
+      .all(workspaceId, kind) as Array<Record<string, unknown>>
+  }
+
+  getPeriodIndex(
+    workspaceId: string,
+    kind: 'week' | 'month',
+    period: string,
+  ): Record<string, unknown> | undefined {
+    return this.db
+      .prepare('SELECT * FROM period_index WHERE workspace_id = ? AND kind = ? AND period = ?')
+      .get(workspaceId, kind, period) as Record<string, unknown> | undefined
   }
 
   upsertPeriodIndex(input: {
@@ -680,11 +790,19 @@ export class Store {
   insertProposal(input: {
     id: string
     workspaceId: string | null
-    layer: 'user' | 'rule'
+    layer: 'rule'
     title: string
     content: string
     sourceTurn: string | null
   }): void {
+    // The same macro rule can reappear across turns; keep one pending copy
+    // and never re-propose a rule that is already current.
+    if (this.findRuleByContent(input.workspaceId, input.title, input.content) !== undefined) {
+      return
+    }
+    if (this.hasPendingProposal(input.workspaceId, input.title, input.content)) {
+      return
+    }
     this.db
       .prepare(
         `INSERT INTO memory_proposal(id, workspace_id, layer, title, content, status, source_turn, created_at)
@@ -694,10 +812,41 @@ export class Store {
       .run(input.id, input.workspaceId, input.layer, input.title, input.content, input.sourceTurn, nowIso())
   }
 
+  private hasPendingProposal(
+    workspaceId: string | null,
+    title: string,
+    content: string,
+  ): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT 1 FROM memory_proposal
+         WHERE workspace_id IS ? AND layer IN ('rule', 'user')
+           AND title = ? AND content = ?
+         LIMIT 1`,
+      )
+      .get(workspaceId, title, content)
+    return row !== undefined
+  }
+
+  findRuleByContent(
+    workspaceId: string | null,
+    title: string,
+    content: string,
+  ): Record<string, unknown> | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM cognition_entry
+         WHERE workspace_id IS ? AND layer IN ('rule', 'user')
+           AND status = 'current' AND title = ? AND conclusion = ?
+         LIMIT 1`,
+      )
+      .get(workspaceId, title, content) as Record<string, unknown> | undefined
+  }
+
   upsertCognitionEntry(input: {
     id: string
     workspaceId: string | null
-    layer: 'project' | 'whiteboard' | 'user' | 'rule'
+    layer: 'rule'
     title: string
     conclusion: string
     sourceRelPath: string | null
@@ -742,17 +891,17 @@ export class Store {
   }
 
   listCognitionEntries(workspaceId: string, layer?: string): Array<Record<string, unknown>> {
-    // Global entries (workspace_id IS NULL) apply to every workspace.
+    // Rules are always project-scoped: no global entries.
     if (layer === undefined) {
       return this.db
         .prepare(
-          "SELECT * FROM cognition_entry WHERE (workspace_id = ? OR workspace_id IS NULL) AND status = 'current' AND enabled = 1 ORDER BY layer, updated_at DESC",
+          "SELECT * FROM cognition_entry WHERE workspace_id = ? AND layer IN ('rule', 'user') AND status = 'current' AND enabled = 1 ORDER BY updated_at DESC",
         )
         .all(workspaceId) as Array<Record<string, unknown>>
     }
     return this.db
       .prepare(
-        "SELECT * FROM cognition_entry WHERE (workspace_id = ? OR workspace_id IS NULL) AND layer = ? AND status = 'current' AND enabled = 1 ORDER BY updated_at DESC",
+        "SELECT * FROM cognition_entry WHERE workspace_id = ? AND layer = ? AND status = 'current' AND enabled = 1 ORDER BY updated_at DESC",
       )
       .all(workspaceId, layer) as Array<Record<string, unknown>>
   }
@@ -761,6 +910,27 @@ export class Store {
     return this.db
       .prepare('SELECT * FROM memory_proposal WHERE status = ? ORDER BY created_at')
       .all(status) as Array<Record<string, unknown>>
+  }
+
+  /**
+   * Cheap stamp that changes whenever the workspace's injected rule set changes
+   * (a rule approved, edited, version-bumped, or toggled). The snapshot cache
+   * keys on it, so an approval is visible in the very next turn of the same
+   * session without the UI having to know which session is open.
+   */
+  ruleStamp(workspaceId: string): string {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n,
+                COALESCE(MAX(updated_at), '') AS t,
+                COALESCE(SUM(version), 0) AS v
+         FROM cognition_entry
+         WHERE workspace_id = ? AND layer IN ('rule', 'user')
+           AND status = 'current' AND enabled = 1`,
+      )
+      .get(workspaceId) as { n: number; t: string; v: number } | undefined
+    if (row === undefined) return '0::0'
+    return `${row.n}:${row.t}:${row.v}`
   }
 
   findActiveLocation(volumeUuid: string | null, inode: number | null): Record<string, unknown> | undefined {
@@ -829,6 +999,27 @@ export class Store {
          LIMIT 1`,
       )
       .get(workspacePath) as Record<string, unknown> | undefined
+  }
+
+  /** Active-location lookup by canonical path (the DSH registry path). */
+  findWorkspaceByActivePath(workspacePath: string): Record<string, unknown> | undefined {
+    if (workspacePath === '') return undefined
+    return this.db
+      .prepare(
+        `SELECT * FROM workspace_location
+         WHERE current_path = ? AND status = 'active'
+         ORDER BY last_seen DESC LIMIT 1`,
+      )
+      .get(workspacePath) as Record<string, unknown> | undefined
+  }
+
+  updateWorkspaceDisplayName(workspaceId: string, displayName: string): void {
+    this.db
+      .prepare(
+        `UPDATE workspace_identity SET display_name = ?
+         WHERE workspace_id = ? AND display_name != ?`,
+      )
+      .run(displayName, workspaceId, displayName)
   }
 
   getWorkspaceIdentity(workspaceId: string): Record<string, unknown> | undefined {
@@ -915,19 +1106,34 @@ export class Store {
   // ---------------------------------------------------------------------------
 
   /** One keyset page of day rows, newest first, joined to the workspace name. */
-  listDayPage(beforeDate: string | null, beforeWorkspaceId: string | null, limit: number): Array<Record<string, unknown>> {
+  listDayPage(
+    beforeDate: string | null,
+    beforeWorkspaceId: string | null,
+    limit: number,
+    workspaceId?: string | null,
+  ): Array<Record<string, unknown>> {
     const hasCursor = beforeDate !== null && beforeWorkspaceId !== null
+    const hasWorkspace = workspaceId !== undefined && workspaceId !== null && workspaceId !== ''
     return this.db
       .prepare(
         `SELECT d.local_date, d.workspace_id, d.title, d.turn_count, d.report_rel_path,
                 w.display_name
          FROM day_index d
          LEFT JOIN workspace_identity w ON w.workspace_id = d.workspace_id
-         WHERE (? = 0 OR d.local_date < ? OR (d.local_date = ? AND d.workspace_id > ?))
+         WHERE (? = 0 OR d.workspace_id = ?)
+           AND (? = 0 OR d.local_date < ? OR (d.local_date = ? AND d.workspace_id > ?))
          ORDER BY d.local_date DESC, d.workspace_id ASC
          LIMIT ?`,
       )
-      .all(hasCursor ? 1 : 0, beforeDate, beforeDate, beforeWorkspaceId, limit) as Array<Record<string, unknown>>
+      .all(
+        hasWorkspace ? 1 : 0,
+        workspaceId ?? '',
+        hasCursor ? 1 : 0,
+        beforeDate,
+        beforeDate,
+        beforeWorkspaceId,
+        limit,
+      ) as Array<Record<string, unknown>>
   }
 
   getRootAbsolute(rootId: string): string | undefined {
@@ -958,7 +1164,7 @@ export class Store {
       `SELECT c.*, w.display_name
        FROM cognition_entry c
        LEFT JOIN workspace_identity w ON w.workspace_id = c.workspace_id
-       WHERE c.status = 'current' ${filter}
+       WHERE c.status = 'current' AND c.layer IN ('rule', 'user') ${filter}
        ORDER BY c.layer, c.updated_at DESC
        LIMIT ?`,
     )
@@ -970,7 +1176,7 @@ export class Store {
   createCognitionEntry(input: {
     id: string
     workspaceId: string | null
-    layer: 'project' | 'whiteboard' | 'user' | 'rule'
+    layer: 'rule'
     title: string
     conclusion: string
     enabled: boolean
@@ -997,7 +1203,7 @@ export class Store {
   updateCognitionEntry(input: {
     id: string
     workspaceId: string | null
-    layer: 'project' | 'whiteboard' | 'user' | 'rule'
+    layer: 'rule'
     title: string
     conclusion: string
     enabled: boolean
@@ -1067,6 +1273,7 @@ export class Store {
     action: 'approve' | 'reject'
     reviewer: string
     reason: string | null
+    workspaceId?: string | null
   }): { entryId: string | null } {
     return this.tx(() => {
       const proposal = this.db.prepare('SELECT * FROM memory_proposal WHERE id = ?').get(input.id) as
@@ -1082,24 +1289,32 @@ export class Store {
 
       if (input.action === 'reject') return { entryId: null }
       const entryId = `cog-${input.id}`
-      const layer = String(proposal.layer ?? 'user')
+      const proposalWorkspace =
+        typeof proposal.workspace_id === 'string' && proposal.workspace_id !== ''
+          ? proposal.workspace_id
+          : null
+      const inputWorkspace = input.workspaceId ?? null
+      const workspaceId =
+        proposalWorkspace ?? (inputWorkspace === '' ? null : inputWorkspace)
+      if (workspaceId === null) {
+        throw new Error('rule proposal has no workspace')
+      }
+      const title = String(proposal.title ?? '')
+      const content = String(proposal.content ?? '')
+      const duplicate = this.findRuleByContent(workspaceId, title, content)
+      if (duplicate !== undefined) {
+        return { entryId: String(duplicate.id) }
+      }
       this.db
         .prepare(
           `INSERT INTO cognition_entry(id, workspace_id, layer, title, conclusion, status, enabled, version, source_rel_path, root_id, updated_at)
-           VALUES (?, ?, ?, ?, ?, 'current', 1, 1, NULL, 'default', ?)
+           VALUES (?, ?, 'rule', ?, ?, 'current', 1, 1, NULL, 'default', ?)
            ON CONFLICT(id) DO UPDATE SET
              title = excluded.title,
              conclusion = excluded.conclusion,
              updated_at = excluded.updated_at`,
         )
-        .run(
-          entryId,
-          typeof proposal.workspace_id === 'string' ? proposal.workspace_id : null,
-          layer === 'rule' ? 'rule' : 'user',
-          String(proposal.title ?? ''),
-          String(proposal.content ?? ''),
-          now,
-        )
+        .run(entryId, workspaceId, title, content, now)
       return { entryId }
     })
   }

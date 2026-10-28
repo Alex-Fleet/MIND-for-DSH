@@ -31,7 +31,7 @@ interface LlmLike {
  */
 export function createLlmSummarizer(options: LlmSummarizerOptions): SummarizeFn {
   const timeoutMs = options.timeoutMs ?? 120_000
-  const maxTokens = options.maxTokens ?? 1024
+  const maxTokens = options.maxTokens ?? 2048
 
   return async (turn, markdown) => {
     const ctx = options.ctx as { get?: (name: string) => unknown } | null
@@ -51,11 +51,11 @@ export function createLlmSummarizer(options: LlmSummarizerOptions): SummarizeFn 
     const configuredModel = options.model !== undefined && options.model !== ''
     const selected = configuredProvider || configuredModel
       ? {
-          provider: configuredProvider ? String(options.provider) : 'deepseek-official',
+          provider: configuredProvider ? String(options.provider) : 'deepseek-account',
           model: configuredModel ? String(options.model) : 'deepseek-flash',
         }
       : {
-          provider: detected?.provider ?? 'deepseek-official',
+          provider: detected?.provider ?? 'deepseek-account',
           model: detected?.model ?? 'deepseek-flash',
         }
 

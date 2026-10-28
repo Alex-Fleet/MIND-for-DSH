@@ -5,6 +5,8 @@ export const STANDARD_FILES = [
   'behavior-standards.md',
   'programming-standards.md',
   'checklists-index.md',
+  'exps-index.md',
+  'user-profile.md',
 ] as const
 
 /**
@@ -40,7 +42,7 @@ export function createStandardsProvider(dir: string): () => string {
     cachedMtime = latest
     cached =
       parts.length === 0
-        ? `[MIND] 未找到规范文件。请把 behavior-standards.md / programming-standards.md / checklists-index.md 放到 ${dir}。`
+        ? `[MIND] 未找到规范文件。请把 behavior-standards.md / programming-standards.md / checklists-index.md / exps-index.md / user-profile.md 放到 ${dir}。`
         : parts.join('\n\n---\n\n')
     return cached
   }

@@ -1,4 +1,3 @@
-import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import type { ResolvedConfig } from '../config.js'
@@ -7,7 +6,7 @@ import { renderTurnMarkdown, turnMachineLine } from './render.js'
 import type { CapturedTurn } from './types.js'
 import type { SummarizeFn } from '../summarize/llm.js'
 import type { TurnSummary } from '../summarize/parse.js'
-import { rebuildDayIndex, rebuildMonthIndex, rebuildWeekIndex } from '../views/navigation.js'
+import { rebuildDayIndex, rebuildMonthIndex } from '../views/navigation.js'
 import { detectModel } from '../summarize/llm.js'
 import { previewFromMarkdown, readTurnPreview } from '../turns/preview.js'
 import { countChars } from '../turns/read.js'
@@ -211,6 +210,13 @@ export class CaptureWorker {
 
     try {
       this.store.refreshDayIndex(workspaceId, localDate, context.rootId)
+      const day = this.store.getDayIndex(workspaceId, localDate)
+      if (day === undefined || String(day.report_rel_path ?? '') === '') {
+        // The hot-path refresh only updates title/count. Materialize the
+        // report immediately so today's turns are readable before summaries
+        // finish, without touching an existing migrated report.
+        rebuildDayIndex(this.store, this.config.mindRoot, workspaceId, localDate, context.rootId)
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       console.warn(`[mind-dsh] day index refresh failed: ${message}`)
@@ -404,11 +410,17 @@ export class CaptureWorker {
   }
 
   private async consumeJobs(): Promise<void> {
+    let failures = 0
     for (;;) {
       const job = this.store.claimJob(this.owner, this.config.leaseMs)
       if (job === null) return
       const ok = await this.processJob(job)
-      if (!ok) return
+      if (!ok) {
+        // A failed job is rescheduled with backoff. Keep draining other due
+        // jobs instead of letting one bad turn block every newer turn.
+        failures += 1
+        if (failures >= 5) return
+      }
     }
   }
 
@@ -424,6 +436,18 @@ export class CaptureWorker {
       const localDate = String(row.local_date ?? '')
       const rawRelPath = String(row.raw_rel_path ?? '')
       const origin = String(row.origin ?? 'main')
+
+      // Summarization disabled: keep the fallback index as "waiting", never
+      // call the model. Re-enabling summarization will re-queue it; migrated
+      // legacy turns keep their separate `invalid` status and are never queued.
+      if (this.config.summarizeEnabled === false) {
+        this.store.markTurnIndexUnsummarized(job.turnId)
+        this.rebuildViews(workspaceId, localDate, job.turnId, String(row.root_id ?? 'default'))
+        this.store.completeJob(job.id)
+        this.store.updateCaptureStatus(job.sessionId, { lastSeq: job.turnSeq, pending: 0, failed: 0 })
+        this.recent.delete(job.turnId)
+        return true
+      }
 
       // Subagent sessions are raw-only: never spawn a capture child from them.
       if (origin === 'subagent' || this.summarize === undefined) {
@@ -485,39 +509,14 @@ export class CaptureWorker {
       rootId: meta.rootId,
       occurredAt: meta.occurredAt,
     })
-
-    if (summary.worthRemembering) {
-      for (const entry of summary.durable) {
-        const title = redactSecrets(entry.title)
-        const conclusion = redactSecrets(entry.conclusion)
-        if (entry.layer === 'project') {
-          this.store.upsertCognitionEntry({
-            id: `cog-${hash(`${turnId}:${entry.title}`)}`,
-            workspaceId: meta.workspaceId,
-            layer: 'project',
-            title,
-            conclusion,
-            sourceRelPath: meta.rawRelPath,
-            rootId: meta.rootId,
-          })
-        } else {
-          this.store.insertProposal({
-            id: `prop-${hash(`${turnId}:${entry.title}`)}`,
-            workspaceId: meta.workspaceId,
-            layer: 'user',
-            title,
-            content: conclusion,
-            sourceTurn: turnId,
-          })
-        }
-      }
-    }
   }
 
   private rebuildViews(workspaceId: string, localDate: string, turnId: string, rootId: string): void {
     if (localDate === '') return
     rebuildDayIndex(this.store, this.config.mindRoot, workspaceId, localDate, rootId)
-    rebuildWeekIndex(this.store, this.config.mindRoot, workspaceId, localDate, rootId)
+    // Weekly reports were a mechanical list of the same daily titles the month
+    // already aggregates, so they added no information and are no longer built.
+    // Existing `weeks/*.md` and `period_index(kind='week')` rows are kept as-is.
     rebuildMonthIndex(this.store, this.config.mindRoot, workspaceId, localDate.slice(0, 7), rootId)
     void turnId
   }
@@ -576,9 +575,6 @@ function retryDelayMs(attempts: number): number {
   return steps[index] ?? 30 * 60_000
 }
 
-function hash(value: string): string {
-  return crypto.createHash('sha1').update(value).digest('hex').slice(0, 16)
-}
 
 function readSafe(target: string): string {
   try {

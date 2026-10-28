@@ -7,6 +7,7 @@ import { TurnBuffer, type EventLike, type SessionLike } from './capture/buffer.j
 import { CaptureWorker, localDateOf } from './capture/worker.js'
 import { loadPersistedSettings, resolveConfig, savePersistedSettings, type MindConfig } from './config.js'
 import { Store } from './db/store.js'
+import { syncDshWorkspaceNames } from './identity/dsh-names.js'
 import { workspacePathCandidates } from './identity/path.js'
 import { SessionWorkspaceCache } from './identity/session-cache.js'
 import { resolveWorkspace } from './identity/workspace.js'
@@ -86,6 +87,31 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
   const store = new Store(path.join(config.mindRoot, 'mind.db'))
   store.ensureRoot(ROOT_ID, config.mindRoot)
 
+  // DSH owns the user-visible workspace title (including the localized
+  // "默认工作区" for the automatic title). MIND stores its own identity, so
+  // project the DSH title onto the matching MIND workspace before names are
+  // read by the UI.
+  let workspaceRegistry: WorkspaceRegistryLike | null = null
+  let lastWorkspaceSync = 0
+  const syncWorkspaceNames = (force = false): void => {
+    if (workspaceRegistry === null) return
+    const now = Date.now()
+    if (!force && now - lastWorkspaceSync < 30_000) return
+    lastWorkspaceSync = now
+    try {
+      syncDshWorkspaceNames(store, workspaceRegistry.list())
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      console.warn(`[mind-dsh] workspace title sync failed: ${message}`)
+    }
+  }
+  ctx.inject(['workspaceRegistry'], child => {
+    workspaceRegistry = (
+      child as unknown as { workspaceRegistry: WorkspaceRegistryLike }
+    ).workspaceRegistry
+    syncWorkspaceNames(true)
+  })
+
   const buffer = new TurnBuffer()
   const summarize = createLlmSummarizer({
     ctx,
@@ -153,6 +179,21 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
     text: () => (config.injectEnabled ? standards() : ''),
   })
 
+  const snapshotCache = new Map<string, string>()
+
+  /**
+   * Drop every cached snapshot for one session so the next turn rebuilds it.
+   * Used when a compaction/prune changed what the model can still see: the
+   * frozen block must be re-read from the durable store, otherwise both the
+   * folded history and the memory block go missing.
+   */
+  const invalidateSnapshot = (sessionId: string): void => {
+    const prefix = `${sessionId}:`
+    for (const key of snapshotCache.keys()) {
+      if (key.startsWith(prefix)) snapshotCache.delete(key)
+    }
+    lastIncrement.delete(sessionId)
+  }
   c.systemPrompt.context({
     name: 'mind-dsh:snapshot',
     order: 1000,
@@ -169,17 +210,39 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
       const sessionId = typeof agent?.id === 'string' ? agent.id : 'unknown'
       const cwd = agent?.session?.header?.cwd ?? null
       const workspaceId = ensureWorkspace(sessionId, cwd) ?? 'orphan'
-      return buildSnapshot({
+      syncWorkspaceNames()
+      const cacheKey = `${sessionId}:${workspaceId}:${store.ruleStamp(workspaceId)}`
+      const cached = snapshotCache.get(cacheKey)
+      if (cached !== undefined) return cached
+      const text = buildSnapshot({
         store,
         workspaceId,
         rootPath: config.mindRoot,
         localDate: localDateOf(Date.now(), config.dayBoundaryMinutes),
         dayBoundaryMinutes: config.dayBoundaryMinutes,
+        turnBudgetChars: config.turnSummaryChars,
       })
+      snapshotCache.set(cacheKey, text)
+      while (snapshotCache.size > 200) {
+        const oldest = snapshotCache.keys().next().value
+        if (oldest === undefined) break
+        snapshotCache.delete(oldest)
+      }
+      return text
     },
   })
 
-  registerMindTools(c.tools, store, config.mindRoot)
+  registerMindTools(c.tools, store, config.mindRoot, agent => {
+    const sessionId =
+      typeof agent?.session?.id === 'string'
+        ? agent.session.id
+        : typeof agent?.id === 'string'
+          ? agent.id
+          : 'unknown'
+    const cwd = agent?.session?.header?.cwd ?? null
+    const workspaceId = ensureWorkspace(sessionId, cwd)
+    return workspaceId === null || workspaceId === 'orphan' ? null : workspaceId
+  })
 
   // Recover turns that were open when the previous process died. DSH's
   // persisted session log is the source of truth; the live buffer alone
@@ -202,6 +265,7 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
       store,
       config,
       saveSettings: settings => savePersistedSettings(config.mindRoot, settings),
+      refreshWorkspaceNames: () => syncWorkspaceNames(true),
     },
     config.uiEnabled,
   )
@@ -210,9 +274,17 @@ export function apply(ctx: Context, rawConfig: MindConfig = {}): void {
     'session/event',
     ((sessionRaw: unknown, eventRaw: unknown) => {
       const session = sessionRaw as SessionLike
-      const workspaceId = ensureWorkspace(String(session.id ?? 'unknown'), session.header?.cwd ?? null)
+      const sessionId = String(session.id ?? 'unknown')
+      // Compaction/prune folded part of the history away. Rebuild the memory
+      // block on the next turn so the folded span is replaced by durable
+      // memory. This runs even when capture is off, because injection may be
+      // on independently. A failed compaction changed nothing, so it is
+      // ignored.
+      const event = eventRaw as EventLike
+      if (isCompactionSuccess(event)) invalidateSnapshot(sessionId)
+      const workspaceId = ensureWorkspace(sessionId, session.header?.cwd ?? null)
       if (!config.captureEnabled) return
-      const finished = buffer.push(session, eventRaw as EventLike)
+      const finished = buffer.push(session, event)
       if (finished === null) return
       worker.enqueue(finished, {
         workspaceId: workspaceId ?? 'orphan',
@@ -297,6 +369,10 @@ interface SessionPersistenceLike {
   list(options?: unknown): Promise<readonly PersistedSessionRecord[]>
   stat?(id: string, options?: unknown): Promise<{ eventCount?: number } | undefined>
   open(id: string, mode: 'read' | 'write', options?: unknown): Promise<SessionHandleLike>
+}
+
+interface WorkspaceRegistryLike {
+  list(): ReadonlyArray<{ id?: unknown; path?: unknown; title?: unknown }>
 }
 
 async function recoverInterruptedTurns(
@@ -399,6 +475,25 @@ async function recoverInterruptedTurns(
   if (recovered > 0) {
     console.log(`[mind-dsh] recovered ${recovered} interrupted turn(s) from session logs`)
   }
+}
+
+/**
+ * True when a session event means context was successfully compacted or
+ * pruned: `compaction/end` without an error, or `compaction/prune`.
+ *
+ * DSH emits `compaction/start` → `compaction/summary` → `compaction/end` for a
+ * summarising compaction, and a standalone `compaction/prune` for a pure
+ * trim. Manual `/compact` commands carry `sourceCommandId`; automatic ones do
+ * not. Both success paths invalidate the snapshot; a failed `compaction/end`
+ * carries `error` and must not.
+ */
+export function isCompactionSuccess(event: EventLike): boolean {
+  if (event.type === 'compaction/prune') return true
+  if (event.type !== 'compaction/end') return false
+  const data = event.data
+  if (data === null || typeof data !== 'object') return true
+  const error = (data as Record<string, unknown>).error
+  return error === undefined || error === null || error === ''
 }
 
 /** Stable path-derived workspace id until Step 5 adds inode identity. */

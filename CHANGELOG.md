@@ -6,31 +6,46 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
-- Web UI: sidebar「记忆」entry and a full-area main panel with 时间线 / 当前 / 工作区 / 提案 / 设置 tabs.
+- Injection contract: all project rules, all monthly reports (full text), the continuous 21-day daily window ending 7 days before today, and 7-day turn summaries. Turn summaries use a configurable `turnSummaryChars` budget (default 100K) and aggregate older overflow by day instead of dropping or listing every turn.
+- Migrated legacy day/month reports are immutable: view rebuilds update index counts but never overwrite curated report text.
+- Web UI: sidebar「记忆」entry and a full-area main panel with 时间线 / 规则 / 工作区 / 提案 / 设置 tabs.
 - Timeline keyset pagination (50 days per page) with virtual scrolling; day detail and chunked raw-turn reading.
-- Structured entry editor (B+): title, project/global scope, Markdown edit/preview, enable switch.
-- Proposal review: approve/reject with pending badge; approval creates an editable entry.
+- Structured rule editor (B+): title, project scope, Markdown edit/preview, enable switch.
+- Proposal review: approve/reject with pending badge; approval creates an editable project rule.
 - Settings page: capture/inject toggles persisted to `$DSH_HOME/mind/settings.json`.
 - `/api/mind.*` exact Fetch routes on DSH's authenticated owner channel.
 - `mind_read_turn` and `mind_search` model tools (shared chunk reader with the UI).
+- `mind_remember` model tool: the main agent can record a durable project rule as a pending proposal for user review; it never activates a rule directly.
+- `user-profile.md` is now part of the static standards section, injected alongside behavior/programming/checklists-index.
+- `exps-index.md` is injected as an advisory engineering-experience index; the full exps files stay on-demand and are explicitly not mandatory rules.
 
 ### Changed
 
+- LLM turn summarization is on by default (`summarizeEnabled=true`): the summary is the index layer, so a turn without one only has a fallback preview. `summarizeEnabled=false` remains an explicit degradation switch. Migrated turns that were already `invalid`/`merged` in the legacy DB stay `invalid` and are not re-summarized.
+- The frozen snapshot is rebuilt when the workspace's rule set changes: the cache key now carries a rule stamp (count + latest update + summed versions), so an approved rule is visible in the next turn of the same session.
+- The frozen snapshot is also rebuilt after a successful compaction or prune (`compaction/end` without an error, or `compaction/prune`); a failed compaction does not trigger it.
+- Snapshot sections are ordered oldest → newest and slowest → fastest changing: project rules → all monthly reports → the 21-day daily window → the 7-day turn summaries → the 30-day time axis → the date line. The date line and time axis change daily, so keeping them last stops them from invalidating the historical prefix every midnight.
+- Turn summaries are index-only. The background summarizer no longer emits rule proposals; only the main agent can create proposals, on explicit user request or a high-confidence durable rule.
 - Schema v4: `turns.raw_events_rel_path` / `turns.raw_chars`; schema v3 adds provider/model; v2 adds `cognition_entry.enabled` and `app_setting`. `Store.migrate()` verifies and repairs columns on every open, not only on a version bump.
 - Every turn writes a full event JSONL alongside the readable Markdown, so system/attempt/tool/compaction payloads are retained.
 - Raw writes are fsync'd; ingest (turn, events, job, fallback index) commits in one transaction; events and machine JSONL are deduplicated.
 - Summary failures now retry forever with a capped backoff (5s → 30m); the lease is 5 minutes and a hard timeout prevents a hung stream from blocking the drain loop.
 - Startup recovery: unclosed turns are rebuilt from `sessionPersistence`, orphan raw files are reconciled, missing/stale day views are rebuilt, and dead/failed/pending summary jobs are re-armed.
-- The snapshot gives the time axis first claim on the character budget; rules and cognition share only the remainder, and the closing tag is never dropped. Workspace display names are injected.
+- The snapshot is built once per session and reused; today's turns are excluded from the snapshot and delivered through the per-turn increment, so new turns no longer re-append the entire memory block.
+- Snapshot sections (monthly reports, daily reports, turn summaries, time axis) are ordered oldest → newest for stable prefix caching.
 - All local dates/times use Beijing time (UTC+8) with a 04:00 day boundary, including the capture worker's `local_date`.
 - MIND root is 0700 and files 0600, including SQLite WAL/SHM, settings, and navigation views; model-facing summaries, proposals, snapshots, increments, and tools redact credential-shaped text.
-- Cognition versions only bump when content changes.
+- Rule versions only bump when content changes.
 - The timeline expands inline (56px indent, rounded inset highlight, no side pane, no hard guide line).
 - Day index refresh is cheap at capture; full views are rebuilt on summary/startup; increments use the last main turn query.
 - Dev dependencies aligned to DSH `0.2.1-rc.2`.
 
 ### Fixed
 
+- Restart no longer re-queues migrated turns that never had a summary. `requeueSummaryFailures()` now only re-arms jobs whose `turn_index.status` is `unsummarized`, so the 376 legacy turns (2026-09-24 … 09-26) that were marked `unsummarized` by the migration stopped being re-summarized on every restart; they are now `invalid` and permanently parked. Disabling summarization also marks new turns `unsummarized` (paused, resumable) instead of `invalid` (never resumed), keeping the two cases distinct.
+- Restored curated daily/monthly reports that had been overwritten by deterministic view rebuilds; the files now come from the legacy `nailong.db` source and are protected by legacy markers.
+- Missing day reports are materialized immediately after a turn is ingested, so today's timeline is readable before summaries finish.
+- Summary jobs are processed newest-turn-first and a failed job no longer blocks the rest of the queue; summary fallback uses the mounted `deepseek-account` provider instead of a non-existent `deepseek-official` provider.
 - Duplicate ingest no longer downgrades a completed LLM index back to the fallback preview.
 - Orphan raw reconciliation counts only DB-missing turns, so existing files can no longer starve an orphan beyond the first 200.
 - Legacy dead summary jobs are re-armed even when the turn predates the provider/model columns.
@@ -58,6 +73,22 @@ All notable changes to this project are documented here. The format follows [Kee
 - Raw recovery reads only the file head plus a streaming character count, caps event JSONL input, and writes the machine line before the DB commit.
 - The machine-line dedupe cache is bounded and invalidates when the file's size/mtime changes.
 - Large-file reads seek through bounded UTF-8 character checkpoints instead of scanning from byte 0 on every page.
+- Timeline rows use `workspace name - date` as the primary title; the day's first-turn summary is now the subtitle. A workspace selector at the top of the timeline filters both the page and its keyset pagination.
+- Workspace names are projected from the DSH workspace registry: renames are picked up, and the automatic `default-workspace` title is displayed as the localized `默认工作区`. Every dropdown (timeline workspace filter and rule editor project picker) uses the shell's `Menu` primitive instead of a native `<select>`; the native control remains only as a fallback when the primitive module is unavailable.
+- Long-term memory is rules-only: the summary emits project-level long-term rules, every rule goes through the proposal queue, and approved rules are workspace-scoped. Automatic project notes/whiteboard writes and their UI/snapshot sections are removed.
+- The summary prompt now separates rules from one-off facts: specific watch targets, transient prices, and temporary tasks are rejected; macro, durable project methods/constraints are accepted.
+- The former「当前」tab is now「规则」; the editor no longer offers a global scope.
+- The same macro rule appearing in later turns is deduplicated against pending/approved proposals and current rules, so it cannot be approved twice.
+- A one-time migration converts legacy `user` rules to `rule`, retires `project`/`whiteboard` rows (kept but hidden), and records the migration flag in `app_setting`.
+- The dropdown trigger is now rendered inside the DSH `Menu` root, restoring keyboard navigation, Escape/Tab behavior, and click-to-close; the native select appears only when the primitives module is missing.
+- The rule editor requires an explicit project (no silent attach to the newest workspace) and disables save with a localized hint when no workspace exists.
+- A pending proposal without a workspace can be assigned a project from the proposal card before approval.
+- Rules beyond the 60-item injection cap emit an explicit “more rules not injected” marker instead of disappearing silently.
+- Workspace titles are stored verbatim; the client localizes `default-workspace` to `默认工作区` or `Default Workspace` from the reader's language.
+
+### Removed
+
+- Weekly report generation. A week's report was a mechanical list of the same daily titles the month already aggregates, so it carried no information of its own. `weeks/*.md` files and existing `period_index(kind='week')` rows stay in place as history; nothing new is written. Day and month views are unchanged.
 
 ### Known deferred
 

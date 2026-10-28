@@ -2,6 +2,11 @@
 
 > 版本：**v0.4**（已吸收两轮对抗性审查 + Step 1–6 实现反馈）
 > 目标：在 DeepSeek Harness 上实现**全量保留、可导航、自动捕获**的记忆系统。
+>
+> **实现状态**：本文是设计稿，不是当前契约。**实现契约以 [ARCHITECTURE.md](../ARCHITECTURE.md) 为准。**
+> 下列设计参数已被实现取代，仅保留作设计沿革：12,000 字符快照预算（已取消，改为无硬上限）、
+> 时间轴排在月报之前（已改到最末）、规则 80 字 / 2200 字符上限（已取消，改为全量）、
+> 摘要失败 5 次后 dead（已改为无限退避重试）、摘要默认关闭（已改回默认开启）。
 
 ---
 
@@ -36,7 +41,7 @@
 | 14 | compaction 清理无插件 API | 不承诺；改为总量上限 + 停止追加 + harness compaction 兜底 |
 | 15 | 硬约束范围歧义 | 每轮只注入 `behavior-standards.md` 的「硬性约束」节（实测 4225）；编程/检查单按路径可读 |
 | 16 | 时间轴标题过长 | 标题硬截断 24 字；月份行单独预算 |
-| 17 | 当前认知无选取算法 | 分层配额 + 每条 ≤80 字 + 总上限 2200 |
+| 17 | 规则注入无选取算法 | 每条 ≤80 字 + 总上限 2200 |
 
 ### v0.3 → v0.4（实现反馈，Step 1–6 已落地）
 
@@ -138,7 +143,7 @@ $DSH_HOME/mind/
 ├── mind.db
 ├── roots.json                      # root_id → 绝对根
 ├── projects/<workspace-id>/
-│   ├── project.md                  # 当前认知（由 DB 派生）
+│   ├── project.md                  # 项目规则（由 DB 派生）
 │   ├── plan.md
 │   ├── turns/YYYY-MM-DD/<turn-id>.md   # 多行、硬换行（模型可读）
 │   ├── index/YYYY-MM-DD.jsonl          # 机器索引（元数据+摘要指针）
@@ -265,10 +270,10 @@ CREATE TABLE period_index (
   PRIMARY KEY(workspace_id, kind, period)
 );
 
--- 当前认知（单一权威）
+-- 项目规则（单一权威，workspace-scoped）
 CREATE TABLE cognition_entry (
   id TEXT PRIMARY KEY, workspace_id TEXT,
-  layer TEXT,             -- project/whiteboard/user/rule
+  layer TEXT,             -- rule only (project-scoped)
   title TEXT, conclusion TEXT,
   status TEXT DEFAULT 'current', version INTEGER DEFAULT 1,
   source_rel_path TEXT, root_id TEXT, updated_at TEXT
@@ -400,11 +405,10 @@ for job in capture_job where state=pending and next_at<=now:
 - 每行约 70 字符；30 行 ≈ 2100；月份入口单独 ≤100。
 - 标题硬截断 24 字。
 
-### 6.2 当前认知
+### 6.2 项目规则
 
-- 项目笔记 / 白板 / 用户规则
-- 分层配额：project ≤60%、whiteboard/user 各保底 10%
-- 每条 ≤80 字；总上限 2200；按日期倒序 + 优先级。
+- 只包含已批准的项目级长期规则。
+- 每条 ≤80 字；总上限 2200；按更新时间倒序。
 
 ### 6.3 下钻
 
@@ -446,7 +450,7 @@ for job in capture_job where state=pending and next_at<=now:
 | 3 | 检索指引（怎么下钻/分块读） | 几乎不变 |
 | 4 | 工作区 | 切工作区时 |
 | 5 | 硬约束（用户级规则） | 用户改规则时 |
-| 6 | 当前认知（项目笔记/白板/偏好） | 有新长期结论时 |
+| 6 | 项目规则（提案批准后） | 用户批准规则时 |
 | 7 | 本地日期 + 日界 | 每天 |
 | 8 | 时间轴（最近 30 天，不含今天） | 每天 |
 
@@ -457,7 +461,7 @@ for job in capture_job where state=pending and next_at<=now:
 3. 检索指引：按路径读；>50KB 用 mind_read_turn
 4. 工作区：MIND-for-DSH
 5. 硬约束（用户级规则）
-6. 当前认知（项目笔记/白板/用户偏好）
+6. 项目规则（已批准）
 7. 日期：2026-10-19（日界 04:00）
 8. 时间轴（最近 30 天，不含今天）
 </mind_memory>
@@ -483,7 +487,7 @@ for job in capture_job where state=pending and next_at<=now:
 | 静态层（行为规范+编程规范+检查单索引） | **14,831 字符**（常驻，缓存命中） |
 | 动态快照总量 | 12,000 字符 |
 | 时间轴（30 天） | 2,200（标题≤24字） |
-| 当前认知 | 2,200 |
+| 项目规则 | 2,200 |
 | 增量层上限 | 4,000（累计） |
 | 指引/提醒 | 400 |
 | 余量 | 其余 |
@@ -492,7 +496,7 @@ for job in capture_job where state=pending and next_at<=now:
 
 ### 7.4 优先级
 
-- `must`：来源身份、硬约束、时间轴、当前认知
+- `must`：来源身份、项目规则、时间轴
 - `normal`：今天增量
 - `low`：可截断
 - `must` 永不丢
@@ -658,7 +662,7 @@ C. inode 复用防护：
 
 1. 文件夹重命名/同卷移动 → 新路径继承旧记忆
 2. 复制品 → 默认分叉，不串历史
-3. 每轮上下文含硬约束 + 当前认知 + 时间轴
+3. 每轮上下文含项目规则 + 时间轴
 4. 任意记忆可从时间轴读到多行原文；>50KB 可 `mind_read_turn` 分块
 5. 日/周/月每条可追溯到 turn_id（legacy 月报除外，显式标记）
 6. UI 列表不全量加载

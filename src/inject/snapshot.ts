@@ -1,5 +1,8 @@
+import fs from 'node:fs'
+import path from 'node:path'
 import type { Store } from '../db/store.js'
 import { redactSecrets } from '../security/redact.js'
+import { BEIJING_OFFSET_MS, localDateOf } from '../time.js'
 
 export interface SnapshotOptions {
   store: Store
@@ -8,31 +11,34 @@ export interface SnapshotOptions {
   localDate: string
   dayBoundaryMinutes: number
   maxDays?: number
-  maxCognition?: number
-  maxChars?: number
+  /** Character budget for full turn summaries; overflow is grouped by day. */
+  turnBudgetChars?: number
 }
+
+const DAILY_WINDOW_DAYS = 21
+const DAILY_WINDOW_END_OFFSET = 7
+const TURN_WINDOW_DAYS = 7
 
 /**
  * Build the low-frequency memory snapshot.
  *
- * Ordering is cache-maximizing: stable identity first, then rules, cognition,
- * date, and the time axis. Budgets are per section: a large rules/cognition
- * set can be truncated, but the time axis and the closing tag are never
- * dropped (the axis is the only always-present historical index).
+ * No character budget: the harness has no hook-output cap, so every layer is
+ * injected in full. The caller decides how much context it can afford.
+ *
+ * Section order is cache-maximizing: slowest-changing material first, the
+ * daily-changing tail last. Inside each section entries run oldest → newest,
+ * so new material is appended at the end and the longest stable prefix stays
+ * byte-identical across sessions.
  */
 export function buildSnapshot(options: SnapshotOptions): string {
   const { store, workspaceId, rootPath, localDate } = options
   const days = options.maxDays ?? 30
-  const maxCognition = options.maxCognition ?? 40
-  const maxChars = options.maxChars ?? 12_000
 
   const identity = store.getWorkspaceIdentity(workspaceId)
   const displayNameRaw =
     typeof identity?.display_name === 'string' && identity.display_name.trim() !== ''
       ? identity.display_name.trim()
       : workspaceId
-  // Redact before clipping: clipping first can cut a credential in half and
-  // make it invisible to the pattern matcher.
   const displayName = redactSecrets(displayNameRaw)
 
   const header = [
@@ -43,166 +49,155 @@ export function buildSnapshot(options: SnapshotOptions): string {
     `[工作区] ${displayName} (${workspaceId})`,
   ]
 
-  const rules = [
+  // `user` is the pre-rules layer; keep reading it so an un-migrated vault
+  // still injects its approved rules.
+  const allRules = [
     ...store.listCognitionEntries(workspaceId, 'rule'),
     ...store.listCognitionEntries(workspaceId, 'user'),
   ]
-    .slice(0, 30)
-    .map(entry => {
-      const title = clip(redactSecrets(String(entry.title ?? '')), 80)
-      const conclusion = clip(redactSecrets(String(entry.conclusion ?? '')), 240)
-      return `- ${title}: ${conclusion}`
-    })
+  const rules = allRules.map(entry => {
+    const title = redactSecrets(String(entry.title ?? ''))
+    const conclusion = redactSecrets(String(entry.conclusion ?? ''))
+    return `- ${title}: ${conclusion}`
+  })
 
-  const cognition = store
-    .listCognitionEntries(workspaceId, 'project')
-    .concat(store.listCognitionEntries(workspaceId, 'whiteboard'))
-    .slice(0, maxCognition)
-    .map(entry => {
-      const title = clip(redactSecrets(String(entry.title ?? '')), 80)
-      const conclusion = clip(redactSecrets(String(entry.conclusion ?? '')), 240)
-      return `- ${title}: ${conclusion}`
-    })
+  const axisRows = store.listRecentDays(workspaceId, localDate, days).reverse()
+  const axis = axisRows.map(day => {
+    const date = String(day.local_date ?? '')
+    const title = redactSecrets(String(day.title ?? ''))
+    const count = Number(day.turn_count ?? 0)
+    const report = redactSecrets(String(day.report_rel_path ?? ''))
+    return `- ${date} · ${title} · ${count} turns${report === '' ? '' : ` · ${report}`}`
+  })
 
-  // Newest first: when the budget cuts the axis, the most recent days must
-  // survive. Display order is reversed below.
-  const axisRows = store.listRecentDays(workspaceId, localDate, days)
-  const axis = axisRows.length === 0
-    ? ['- (暂无)']
-    : axisRows.map(day => {
-        const date = String(day.local_date ?? '')
-        const title = clip(redactSecrets(String(day.title ?? '')), 80)
-        const count = Number(day.turn_count ?? 0)
-        const report = redactSecrets(String(day.report_rel_path ?? ''))
-        return `- ${date} · ${title} · ${count} turns${report === '' ? '' : ` · ${report}`}`
-      })
+  const monthlies = store.listAllPeriods(workspaceId, 'month').reverse().map(row =>
+    reportBlock(rootPath, row, 'period', 'title'),
+  )
+
+  // Continuous 21-day window ending before the most recent 7 days.
+  const dailyEndExclusive = new Date(`${localDate}T00:00:00.000Z`)
+  dailyEndExclusive.setUTCDate(dailyEndExclusive.getUTCDate() - DAILY_WINDOW_END_OFFSET)
+  const dailyStart = new Date(dailyEndExclusive)
+  dailyStart.setUTCDate(dailyStart.getUTCDate() - DAILY_WINDOW_DAYS)
+  const dailies = store
+    .listDaysBetween(
+      workspaceId,
+      dailyStart.toISOString().slice(0, 10),
+      dailyEndExclusive.toISOString().slice(0, 10),
+    )
+    .reverse()
+    .map(row => reportBlock(rootPath, row, 'local_date', 'title'))
+
+  // Keep today's turns out of the snapshot: the per-turn increment carries
+  // them. Otherwise every new turn changes the snapshot and DSH re-appends
+  // the whole memory block as a new in-history context message.
+  const turnEndExclusive = new Date(
+    Date.parse(`${localDate}T00:00:00.000Z`) -
+      BEIJING_OFFSET_MS +
+      options.dayBoundaryMinutes * 60_000,
+  )
+  const turnStart = new Date(turnEndExclusive)
+  turnStart.setUTCDate(turnStart.getUTCDate() - TURN_WINDOW_DAYS)
+  const turnBudgetChars = options.turnBudgetChars ?? 100_000
+  const turns: string[] = []
+  const overflowByDay = new Map<string, number>()
+  let overflowTotal = 0
+  let usedTurnChars = 0
+
+  for (const row of store.listRecentTurnIndexes(
+    workspaceId,
+    turnStart.toISOString(),
+    turnEndExclusive.toISOString(),
+  )) {
+    const occurred = String(row.occurred_at ?? '')
+    const title = redactSecrets(String(row.title ?? ''))
+    const conclusion = redactSecrets(String(row.conclusion ?? ''))
+    const rel = String(row.source_rel_path ?? '')
+    const line = `- ${occurred} · ${title}: ${conclusion}${rel === '' ? '' : ` · ${rel}`}`
+    const fits = usedTurnChars + line.length + 1 <= turnBudgetChars
+    const firstWithinBudget = turns.length === 0 && turnBudgetChars > 0
+    if (fits || firstWithinBudget) {
+      turns.push(line)
+      usedTurnChars += line.length + 1
+      continue
+    }
+    const parsed = Date.parse(occurred)
+    const day = Number.isFinite(parsed)
+      ? localDateOf(parsed, options.dayBoundaryMinutes)
+      : occurred.slice(0, 10) || 'unknown'
+    overflowByDay.set(day, (overflowByDay.get(day) ?? 0) + 1)
+    overflowTotal += 1
+  }
+
+  // Oldest → newest: stable prefix first, new material at the tail.
+  turns.reverse()
+  const overflowLines = [...overflowByDay.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(
+      ([day, count]) =>
+        `- ${day} · ${count} turns 未注入 · 目录 projects/${workspaceId}/turns/${day}/`,
+    )
+  if (overflowTotal > 0) {
+    overflowLines.push(`- … 共 ${overflowTotal} 条 turns 未注入`)
+  }
 
   const boundaryHours = Math.floor(options.dayBoundaryMinutes / 60)
   const boundaryMinutes = options.dayBoundaryMinutes % 60
   const dateLine = `[日期] ${localDate}（北京时间，日界 ${String(boundaryHours).padStart(2, '0')}:${String(boundaryMinutes).padStart(2, '0')}）`
-  const axisTitle = `[时间轴 · 最近 ${days} 天]`
-  const closing = '</mind_memory>'
 
-  const base = [...header, '', dateLine, '', axisTitle, ''].join('\n') + `\n${closing}`
-  const available = Math.max(0, maxChars - base.length)
-  // The time axis is the only always-present historical index, so it gets
-  // first claim on the budget. Enrichment sections share only what remains;
-  // the axis is truncated only when it alone exceeds maxChars.
-  const fittedAxis = fitAxis(axis, available)
-  const axisBlock = fittedAxis.block
-  // If even the axis had to be cut, do not spend budget on enrichment: the
-  // recent-day index is more important than rules/cognition.
-  const remaining = fittedAxis.truncated ? 0 : Math.max(0, available - axisBlock.length - 8)
-  const rulesBudget = Math.floor(remaining * 0.5)
-  const cognitionBudget = Math.max(0, remaining - rulesBudget)
-
-  const rulesBlock = fitBlock('[硬约束 — 必须遵守]', rules, rulesBudget)
-  const cognitionBlock = fitBlock('[当前认知]', cognition, cognitionBudget)
-
-  const assemble = (withRules: boolean, withCognition: boolean, axisBlock: string): string =>
+  return redactSecrets(
     [
       ...header,
-      withRules ? rulesBlock : '',
-      withCognition ? cognitionBlock : '',
+      '',
+      '[项目规则 — 必须遵守]',
+      ...(rules.length === 0 ? ['- (暂无)'] : rules),
+      '',
+      '[月报 — 全部历史]',
+      ...(monthlies.length === 0 ? ['- (暂无)'] : monthlies),
+      '',
+      `[日报 — 连续 ${DAILY_WINDOW_DAYS} 天（截至 ${DAILY_WINDOW_END_OFFSET} 天前）]`,
+      ...(dailies.length === 0 ? ['- (暂无)'] : dailies),
+      '',
+      `[Turn 摘要 — 最近 ${TURN_WINDOW_DAYS} 天（完整摘要预算 ${turnBudgetChars} 字符）]`,
+      ...(overflowLines.length === 0
+        ? []
+        : ['[未注入 turns — 按天聚合（较早）]', ...overflowLines, '']),
+      ...(turns.length === 0 ? ['- (暂无)'] : turns),
+      '',
+      `[时间轴 · 最近 ${days} 天]`,
+      ...(axis.length === 0 ? ['- (暂无)'] : axis),
       '',
       dateLine,
-      '',
-      axisTitle,
-      axisBlock,
-      closing,
-    ]
-      .filter(part => part !== '')
-      .join('\n')
-
-  const full = redactSecrets(assemble(true, true, axisBlock))
-  if (full.length <= maxChars) return full
-
-  // Drop enrichment sections before touching the axis.
-  const noCognition = redactSecrets(assemble(true, false, axisBlock))
-  if (noCognition.length <= maxChars) return noCognition
-  const noRules = redactSecrets(assemble(false, false, axisBlock))
-  if (noRules.length <= maxChars) return noRules
-
-  const minimalBase = [...header, '', dateLine, '', axisTitle, '', closing].join('\n')
-  if (minimalBase.length > maxChars) {
-    return cap(`${header.join('\n')}\n${closing}`, maxChars, closing)
-  }
-  const axisOnly = fitBlock('', axis, Math.max(0, maxChars - minimalBase.length))
-  return cap(
-    redactSecrets([...header, '', dateLine, '', axisTitle, axisOnly, closing].join('\n')),
-    maxChars,
-    closing,
+      '</mind_memory>',
+    ].join('\n'),
   )
 }
 
-function cap(text: string, maxChars: number, closing: string): string {
-  if (text.length <= maxChars) return text
-  if (maxChars <= closing.length) return closing.slice(0, maxChars)
-  return `${text.slice(0, maxChars - closing.length - 1)}\n${closing}`
+function reportBlock(
+  rootPath: string,
+  row: Record<string, unknown>,
+  periodKey: string,
+  titleKey: string,
+): string {
+  const period = String(row[periodKey] ?? '')
+  const title = redactSecrets(String(row[titleKey] ?? ''))
+  const rel = String(row.report_rel_path ?? '')
+  const body = readReportFile(rootPath, rel)
+  const lines = [`### ${period}: ${title}`]
+  lines.push(body === null ? `（报告文件缺失：${rel === '' ? '(空路径)' : rel}）` : body)
+  if (rel !== '') lines.push(`→ ${rel}`)
+  lines.push('')
+  return lines.join('\n')
 }
 
-/**
- * Select the most recent days first, then reverse for chronological display.
- * A truncation marker at the top means older days were omitted.
- */
-function fitAxis(linesNewestFirst: string[], budget: number): { block: string; truncated: boolean } {
-  if (budget <= 0) return { block: '', truncated: true }
-  const marker = '- …（更早的日期已省略）'
-  const select = (limit: number): string[] => {
-    const kept: string[] = []
-    let used = 0
-    for (const line of linesNewestFirst) {
-      if (used + line.length + 1 > limit) break
-      kept.push(line)
-      used += line.length + 1
-    }
-    return kept
+function readReportFile(rootPath: string, relPath: string): string | null {
+  if (relPath === '') return null
+  const root = path.resolve(rootPath)
+  const file = path.resolve(root, relPath)
+  if (file !== root && !file.startsWith(root + path.sep)) return null
+  try {
+    return fs.readFileSync(file, 'utf8').trim()
+  } catch {
+    return null
   }
-
-  let kept = select(budget)
-  if (kept.length < linesNewestFirst.length) {
-    kept = select(Math.max(0, budget - marker.length - 1))
-  }
-  if (kept.length === 0) {
-    return { block: budget >= marker.length ? marker : '', truncated: true }
-  }
-  const truncated = kept.length < linesNewestFirst.length
-  const display = [...kept].reverse()
-  return {
-    block: `${truncated ? `${marker}\n` : ''}${display.join('\n')}`,
-    truncated,
-  }
-}
-
-function fitBlock(title: string, lines: string[], budget: number): string {
-  if (budget <= 0) return ''
-  const heading = title === '' ? '' : `${title}\n`
-  if (lines.length === 0) {
-    const placeholder = `${heading}- (暂无)`
-    return placeholder.length <= budget ? placeholder : ''
-  }
-
-  const marker = '\n- …（已截断）'
-  const build = (limit: number): string[] => {
-    const kept: string[] = []
-    let used = heading.length
-    for (const line of lines) {
-      if (used + line.length + 1 > limit) break
-      kept.push(line)
-      used += line.length + 1
-    }
-    return kept
-  }
-
-  let kept = build(budget)
-  // Reserve the truncation marker inside the budget; otherwise a block at the
-  // exact limit can overshoot maxChars by the marker length.
-  if (kept.length < lines.length) kept = build(Math.max(0, budget - marker.length))
-  if (kept.length === 0) return ''
-  const truncated = kept.length < lines.length ? marker : ''
-  return `${heading}${kept.join('\n')}${truncated}`
-}
-
-function clip(value: string, max: number): string {
-  return value.length > max ? `${value.slice(0, max)}…` : value
 }

@@ -16,10 +16,18 @@ export interface MindConfig {
   leaseMs?: number
   /** Hard-wrap width for model-readable turn files. */
   wrapWidth?: number
-  /** Directory containing behavior-standards.md, programming-standards.md, checklists-index.md. */
+  /** Directory containing behavior-standards.md, programming-standards.md, checklists-index.md, exps-index.md, user-profile.md. */
   standardsDir?: string
   /** Local day boundary in minutes after midnight (default 240 = 04:00). */
   dayBoundaryMinutes?: number
+  /** Character budget for full turn summaries in the 7-day injection window. */
+  turnSummaryChars?: number
+  /**
+   * Generate LLM turn summaries. This is the index layer of the memory model,
+   * so it is on by default; `false` is an explicit degradation switch that
+   * keeps fallback indexes only.
+   */
+  summarizeEnabled?: boolean
   /** Auxiliary summary provider/model; defaults to the turn's request model. */
   summaryProvider?: string
   summaryModel?: string
@@ -38,6 +46,8 @@ export const DEFAULT_CONFIG: ResolvedConfig = {
   wrapWidth: 800,
   standardsDir: '',
   dayBoundaryMinutes: 240,
+  turnSummaryChars: 100_000,
+  summarizeEnabled: true,
   summaryProvider: '',
   summaryModel: '',
 }
