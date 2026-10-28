@@ -35,9 +35,9 @@ dsh plugin --profile web add /absolute/path/to/MIND-for-DSH
 | 页 | 内容 |
 |---|---|
 | 时间线 | 按天倒序；keyset 分页 + 虚拟滚动；点开看当天 turns，再点开看原文分块 |
-| 当前 | 项目笔记 / 白板 / 用户规则 / 规则；点击进入结构化编辑（标题 / 类型 / 内容 / 启停），内容支持 Markdown 预览 |
+| 规则 | 已批准的项目级长期规则；点击进入结构化编辑（标题 / 项目 / 内容 / 启停），内容支持 Markdown 预览 |
 | 工作区 | 身份、当前路径、inode、置信度；可复制 workspace id |
-| 提案 | 待审用户规则；批准后进入「当前」并参与下一轮注入 |
+| 提案 | 待审项目规则；批准后进入「规则」并参与下一轮注入 |
 | 设置 | 捕获/注入开关、MIND 根目录、规范目录、统计 |
 
 模型侧另有两个工具：`mind_read_turn`（按字符分块读原文）与 `mind_search`（FTS5 检索，CJK 回退到 LIKE）。
@@ -49,7 +49,7 @@ dsh plugin --profile web add /absolute/path/to/MIND-for-DSH
 - `mind.db` — SQLite（WAL），turns / 索引 / 工作区身份 / 提案 / 设置
 - `projects/<workspace-id>/turns/<date>/*.md` — 可读原始 turn，硬换行 800 字符
 - `projects/<workspace-id>/turns/<date>/*.events.jsonl` — 该 turn 的完整事件 payload（system/attempt/tool 等）
-- `projects/<workspace-id>/index/`、`days/`、`weeks/`、`months/` — 机器索引与可读指针视图
+- `projects/<workspace-id>/index/`、`days/`、`months/` — 机器索引与可读指针视图（`weeks/` 是历史遗留，不再生成）
 - `settings.json` — UI 开关的持久化覆盖
 
 ## 可靠性 / 安全 / 时间

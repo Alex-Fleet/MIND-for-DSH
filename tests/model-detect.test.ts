@@ -126,7 +126,7 @@ describe('detectModel', () => {
 
     expect(calls).toEqual([
       { provider: 'cfg-provider', model: 'deepseek-flash' },
-      { provider: 'deepseek-official', model: 'cfg-model' },
+      { provider: 'deepseek-account', model: 'cfg-model' },
     ])
   })
 

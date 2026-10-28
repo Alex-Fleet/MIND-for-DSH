@@ -2,13 +2,15 @@ import { describe, expect, it } from 'vitest'
 import { parseSummary } from '../src/summarize/parse.js'
 
 describe('parseSummary', () => {
-  it('parses a plain JSON object', () => {
+  it('parses the index fields', () => {
     const summary = parseSummary(
-      '{"title":"修复注入","conclusion":"根因是竞态","topics":["注入","竞态"],"durable":[{"layer":"project","title":"注入时序","conclusion":"需要加锁"}],"worthRemembering":true}',
+      '{"title":"修复注入","conclusion":"根因是竞态","topics":["注入","竞态"]}',
     )
-    expect(summary?.title).toBe('修复注入')
-    expect(summary?.topics).toEqual(['注入', '竞态'])
-    expect(summary?.durable[0]?.layer).toBe('project')
+    expect(summary).toEqual({
+      title: '修复注入',
+      conclusion: '根因是竞态',
+      topics: ['注入', '竞态'],
+    })
   })
 
   it('strips a code fence and surrounding prose', () => {
@@ -22,14 +24,12 @@ describe('parseSummary', () => {
     expect(parseSummary('')).toBeNull()
   })
 
-  it('drops invalid durable layers and empty entries', () => {
+  it('ignores legacy rules/durable fields instead of turning them into proposals', () => {
     const summary = parseSummary(
-      '{"title":"t","conclusion":"c","durable":[{"layer":"rule","title":"x","conclusion":"y"},{"layer":"user","title":"","conclusion":"z"}]}',
+      '{"title":"t","conclusion":"c","durable":[{"layer":"user","title":"rule","conclusion":"z"}],"rules":[{"title":"x","conclusion":"y"}],"worthRemembering":true}',
     )
-    expect(summary?.durable).toEqual([])
-  })
-
-  it('defaults worthRemembering to true', () => {
-    expect(parseSummary('{"title":"t","conclusion":"c"}')?.worthRemembering).toBe(true)
+    expect(summary).toEqual({ title: 't', conclusion: 'c', topics: [] })
+    expect(summary).not.toHaveProperty('rules')
+    expect(summary).not.toHaveProperty('worthRemembering')
   })
 })

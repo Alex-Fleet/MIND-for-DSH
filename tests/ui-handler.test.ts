@@ -62,6 +62,35 @@ describe('UI handler', () => {
     deps.store.close()
   })
 
+  it('filters the timeline by workspace', async () => {
+    const deps = makeDeps()
+    seedDay(deps, '2026-10-18', 'ws1 older')
+    seedDay(deps, '2026-10-19', 'ws1 newest')
+    deps.store.upsertWorkspaceIdentity({ workspaceId: 'ws2', displayName: 'Other' })
+    deps.store.upsertDayIndex({
+      workspaceId: 'ws2',
+      localDate: '2026-10-19',
+      title: 'ws2 newest',
+      turnCount: 2,
+      reportRelPath: 'daily/ws2-2026-10-19.md',
+      rootId: 'default',
+      sourceTurnIds: [],
+    })
+
+    const ws1 = await value<{ rows: Array<{ workspaceId: string; date: string }> }>(
+      await handleUiRequest(deps, 'timeline', { workspaceId: 'ws1', limit: 10 }),
+    )
+    expect(ws1.rows.map(row => row.date)).toEqual(['2026-10-19', '2026-10-18'])
+    expect(new Set(ws1.rows.map(row => row.workspaceId))).toEqual(new Set(['ws1']))
+
+    const ws2 = await value<{ rows: Array<{ workspaceId: string; date: string }> }>(
+      await handleUiRequest(deps, 'timeline', { workspaceId: 'ws2', limit: 10 }),
+    )
+    expect(ws2.rows.map(row => row.date)).toEqual(['2026-10-19'])
+    expect(new Set(ws2.rows.map(row => row.workspaceId))).toEqual(new Set(['ws2']))
+    deps.store.close()
+  })
+
   it('returns a day’s turns and pages raw text', async () => {
     const deps = makeDeps()
     seedDay(deps, '2026-10-19', 'today')
@@ -129,7 +158,7 @@ describe('UI handler', () => {
       await handleUiRequest(deps, 'saveEntry', {
         id: 'cog-1',
         layer: 'rule',
-        workspaceId: null,
+        workspaceId: 'ws1',
         title: 'new title',
         content: '# heading\n\nbody',
         enabled: false,
@@ -146,7 +175,7 @@ describe('UI handler', () => {
       title: 'new title',
       content: '# heading\n\nbody',
       enabled: false,
-      workspaceId: null,
+      workspaceId: 'ws1',
     })
     deps.store.close()
   })
@@ -157,7 +186,7 @@ describe('UI handler', () => {
     deps.store.insertProposal({
       id: 'prop-1',
       workspaceId: 'ws1',
-      layer: 'user',
+      layer: 'rule',
       title: 'prefer terse replies',
       content: 'answer directly',
       sourceTurn: 's1:1',
@@ -167,11 +196,43 @@ describe('UI handler', () => {
       await handleUiRequest(deps, 'resolveProposal', { id: 'prop-1', action: 'approve' }),
     )
     expect(approved.entryId).toBe('cog-prop-1')
-    expect(deps.store.listCognitionEntries('ws1', 'user')).toHaveLength(1)
+    expect(deps.store.listCognitionEntries('ws1', 'rule')).toHaveLength(1)
 
     const twice = await handleUiRequest(deps, 'resolveProposal', { id: 'prop-1', action: 'approve' })
     expect(twice.ok).toBe(false)
     if (!twice.ok) expect(twice.error.code).toBe('conflict')
+    deps.store.close()
+  })
+
+  it('requires a workspace when approving a legacy proposal and accepts an explicit one', async () => {
+    const deps = makeDeps()
+    deps.store.upsertWorkspaceIdentity({ workspaceId: 'ws1', displayName: 'Demo' })
+    deps.store.insertProposal({
+      id: 'prop-null',
+      workspaceId: null,
+      layer: 'rule',
+      title: 'legacy rule',
+      content: 'must be attached',
+      sourceTurn: 's1:1',
+    })
+
+    const missing = await handleUiRequest(deps, 'resolveProposal', {
+      id: 'prop-null',
+      action: 'approve',
+    })
+    expect(missing.ok).toBe(false)
+    if (!missing.ok) expect(missing.error.code).toBe('bad-request')
+
+    const approved = await value<{ entryId: string }>(
+      await handleUiRequest(deps, 'resolveProposal', {
+        id: 'prop-null',
+        action: 'approve',
+        workspaceId: 'ws1',
+      }),
+    )
+    expect(approved.entryId).toBe('cog-prop-null')
+    expect(deps.store.getCognitionEntry('cog-prop-null')?.workspace_id).toBe('ws1')
+    expect(deps.store.getCognitionEntry('cog-prop-null')?.layer).toBe('rule')
     deps.store.close()
   })
 

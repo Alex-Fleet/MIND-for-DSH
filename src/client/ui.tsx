@@ -1,8 +1,6 @@
 import {
-  Fragment,
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -11,6 +9,227 @@ import {
 } from 'react'
 import { ApiError, callApi } from './api'
 import { MarkdownPreview } from './markdown'
+
+// The DSH client module loader supplies `require`; primitives are provided by
+// the shell so menus/buttons match the rest of the app.
+declare const require: (id: string) => unknown
+
+interface DshMenuItem {
+  id?: string
+  label?: ReactNode
+  text?: string
+  icon?: ReactNode
+  type?: 'label' | 'separator'
+  submenu?: DshMenuItem[]
+}
+
+interface DshMenuProps {
+  open: boolean
+  anchor?: unknown
+  items: DshMenuItem[]
+  selectedId?: string
+  onSelect?: (id: string) => void
+  onClose?: () => void
+  side?: 'top' | 'bottom' | 'left' | 'right'
+  portal?: boolean
+  getAnchorRect?: () => DOMRect | null
+  children?: ReactNode
+}
+
+interface DshPrimitives {
+  Menu: (props: DshMenuProps) => ReactNode
+  IconChevronsUpDownOutlineRegular: (props: Record<string, unknown>) => ReactNode
+}
+
+let dshPrimitives: DshPrimitives | null = null
+try {
+  dshPrimitives = require('@deepseek-ai/dsh-client-ui-primitives') as DshPrimitives
+} catch {
+  // The native select fallback keeps the timeline usable if the shell does
+  // not expose the primitives module.
+  dshPrimitives = null
+}
+
+const DshMenu = dshPrimitives?.Menu
+const ChevronsUpDown = dshPrimitives?.IconChevronsUpDownOutlineRegular
+
+function workspaceLabel(name: string): string {
+  if (name !== 'default-workspace') return name
+  const language = typeof navigator === 'undefined' ? 'zh' : navigator.language
+  return language.toLowerCase().startsWith('zh') ? '默认工作区' : 'Default Workspace'
+}
+
+/** Display a child without repeating its parent prefix (e.g. "GameExpert / GuanDan"). */
+function childWorkspaceLabel(name: string, parent: string): string {
+  const label = workspaceLabel(name)
+  const prefix = `${parent} / `
+  return label.startsWith(prefix) ? label.slice(prefix.length) : label
+}
+
+/**
+ * Workspace choices as a collapsed tree. Parent groups are native Menu
+ * submenus: they stay collapsed until clicked or hovered, and the Menu
+ * primitive handles one level of expansion per group.
+ */
+function workspaceTreeOptions(workspaces: Workspace[]): SelectOption[] {
+  const parentNames = ['Archived', 'GameExpert', 'Opensource']
+  const pathOf = (workspace: Workspace): string => workspace.paths[0]?.path ?? ''
+  const parents = parentNames
+    .map(name => workspaces.find(workspace => workspace.displayName === name))
+    .filter((workspace): workspace is Workspace => workspace !== undefined)
+  const used = new Set<string>()
+  const options: SelectOption[] = [{ id: '__all__', label: '全部工作区' }]
+
+  for (const parent of parents) {
+    const parentPath = pathOf(parent)
+    if (parentPath === '') continue
+    const children = workspaces
+      .filter(workspace => {
+        if (workspace.workspaceId === parent.workspaceId) return false
+        return pathOf(workspace).startsWith(parentPath + '/')
+      })
+      .sort((a, b) => workspaceLabel(a.displayName).localeCompare(workspaceLabel(b.displayName)))
+    if (children.length === 0) continue
+    used.add(parent.workspaceId)
+    for (const child of children) used.add(child.workspaceId)
+    options.push({
+      id: `__group__${parent.workspaceId}`,
+      label: `${parent.displayName} ›`,
+      submenu: children.map(child => ({
+        id: child.workspaceId,
+        label: childWorkspaceLabel(child.displayName, parent.displayName),
+      })),
+    })
+  }
+
+  for (const workspace of workspaces
+    .filter(workspace => !used.has(workspace.workspaceId))
+    .sort((a, b) => workspaceLabel(a.displayName).localeCompare(workspaceLabel(b.displayName)))) {
+    options.push({ id: workspace.workspaceId, label: workspaceLabel(workspace.displayName) })
+  }
+  return options
+}
+
+interface SelectOption {
+  id: string
+  label: string
+  display?: ReactNode
+  type?: 'label' | 'separator'
+  submenu?: SelectOption[]
+}
+
+function findSelectOption(options: SelectOption[], id: string): SelectOption | undefined {
+  for (const option of options) {
+    if (option.id === id) return option
+    const nested = option.submenu === undefined ? undefined : findSelectOption(option.submenu, id)
+    if (nested !== undefined) return nested
+  }
+  return undefined
+}
+
+/** Native-select fallback: groups have no value of their own, so flatten leaves. */
+function flattenSelectOptions(options: SelectOption[]): SelectOption[] {
+  const flat: SelectOption[] = []
+  for (const option of options) {
+    if (option.type !== undefined) continue
+    if (option.submenu !== undefined) {
+      flat.push(...flattenSelectOptions(option.submenu))
+    } else {
+      flat.push(option)
+    }
+  }
+  return flat
+}
+
+function menuItems(options: SelectOption[]): DshMenuItem[] {
+  return options.map(option => {
+    if (option.type === 'label') return { type: 'label', text: option.label }
+    if (option.type === 'separator') return { type: 'separator' }
+    return {
+      id: option.id,
+      label: option.display ?? option.label,
+      ...(option.submenu === undefined ? {} : { submenu: menuItems(option.submenu) }),
+    }
+  })
+}
+
+/**
+ * One dropdown for every UI selection: the shell Menu primitive when
+ * available, with a native select only as a last-resort fallback.
+ */
+function DshSelect({
+  id,
+  label,
+  options,
+  value,
+  onChange,
+}: {
+  id?: string
+  label: string
+  options: SelectOption[]
+  value: string
+  onChange: (value: string) => void
+}): ReactNode {
+  const [open, setOpen] = useState(false)
+  const selected = findSelectOption(options, value)
+
+  if (DshMenu === undefined) {
+    return (
+      <div className="mind-select-root">
+        <select
+          aria-label={label}
+          className="mind-select-fallback"
+          onChange={event => onChange(event.target.value)}
+          value={value}
+        >
+          {flattenSelectOptions(options).map(option => (
+            <option key={option.id} value={option.id}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </div>
+    )
+  }
+
+  return (
+    <div className="mind-select-root">
+      <DshMenu
+        anchor={
+          <button
+            aria-expanded={open}
+            aria-haspopup="menu"
+            aria-label={label}
+            className="mind-select-trigger"
+            id={id}
+            onClick={() => setOpen(current => !current)}
+            type="button"
+          >
+            <span className="mind-select-value">{selected?.label ?? label}</span>
+            {ChevronsUpDown === undefined ? (
+              <span aria-hidden="true" className="mind-select-caret">
+                ⌄
+              </span>
+            ) : (
+              <ChevronsUpDown />
+            )}
+          </button>
+        }
+        items={menuItems(options)}
+        onClose={() => setOpen(false)}
+        onSelect={next => {
+          if (typeof next !== 'string' || next === '') return
+          onChange(next)
+          setOpen(false)
+        }}
+        open={open}
+        portal
+        selectedId={value}
+        side="bottom"
+      />
+    </div>
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Wire types (the Host handler is the source of truth)
@@ -62,6 +281,26 @@ interface TurnChunk {
   total: number
   next: number | null
   rawPath: string
+}
+
+interface ReportText {
+  path: string
+  content: string
+}
+
+interface PeriodRow {
+  workspaceId: string
+  kind: string
+  period: string
+  title: string
+  reportPath: string
+}
+
+interface PeriodsPage {
+  workspaceId: string
+  kind: string
+  rows: PeriodRow[]
+  truncated: boolean
 }
 
 interface CurrentEntry {
@@ -137,7 +376,7 @@ interface Settings {
   pendingProposals: number
 }
 
-type Tab = 'timeline' | 'current' | 'workspaces' | 'proposals' | 'settings'
+type Tab = 'timeline' | 'reports' | 'current' | 'workspaces' | 'proposals' | 'settings'
 
 // ---------------------------------------------------------------------------
 // Generic UI state
@@ -301,10 +540,6 @@ function Switch({
   )
 }
 
-function layerIcon(layer: string): IconKind {
-  return layer === 'project' || layer === 'whiteboard' || layer === 'user' || layer === 'rule' ? layer : 'project'
-}
-
 // ---------------------------------------------------------------------------
 // Virtual list
 // ---------------------------------------------------------------------------
@@ -406,90 +641,71 @@ function VirtualTimeline({
   renderDetail: (row: TimelineRow) => ReactNode
 }): ReactNode {
   const viewport = useRef<HTMLDivElement>(null)
-  const detailRef = useRef<HTMLDivElement>(null)
-  const [detailHeight, setDetailHeight] = useState(0)
-  const [range, setRange] = useState({ start: 0, end: 20 })
-
-  const heights = items.map(item => 72 + (timelineKey(item) === expandedKey ? detailHeight : 0))
-  const offsets: number[] = []
-  let total = 0
-  for (const height of heights) {
-    offsets.push(total)
-    total += height
-  }
-
-  const recalc = useCallback(() => {
-    const element = viewport.current
-    if (element === null) return
-    const top = element.scrollTop
-    let start = 0
-    for (let index = 0; index < heights.length; index++) {
-      if ((offsets[index] ?? 0) + (heights[index] ?? 0) >= top) {
-        start = Math.max(0, index - 3)
-        break
-      }
-    }
-    let end = start
-    let used = 0
-    for (let index = start; index < heights.length; index++) {
-      used += heights[index] ?? 0
-      end = index + 1
-      if (used > element.clientHeight + 320) break
-    }
-    setRange(previous => (previous.start === start && previous.end === end ? previous : { start, end }))
-    if (onNearEnd !== undefined && element.scrollHeight - (top + element.clientHeight) < 400) {
-      onNearEnd()
-    }
-  }, [items, expandedKey, detailHeight, onNearEnd])
 
   useEffect(() => {
-    recalc()
     const element = viewport.current
     if (element === null) return
-    const onScroll = (): void => recalc()
+    const onScroll = (): void => {
+      if (onNearEnd !== undefined && element.scrollHeight - (element.scrollTop + element.clientHeight) < 400) {
+        onNearEnd()
+      }
+    }
     element.addEventListener('scroll', onScroll, { passive: true })
-    const observer = new ResizeObserver(onScroll)
-    observer.observe(element)
-    return () => {
-      element.removeEventListener('scroll', onScroll)
-      observer.disconnect()
-    }
-  }, [recalc])
+    return () => element.removeEventListener('scroll', onScroll)
+  }, [onNearEnd])
 
-  // useLayoutEffect measures before paint, so the first expanded frame does
-  // not overlap the rows below it.
-  useLayoutEffect(() => {
-    const element = detailRef.current
-    if (element === null) {
-      setDetailHeight(0)
-      return
-    }
-    const update = (): void => setDetailHeight(element.getBoundingClientRect().height)
-    update()
-    const observer = new ResizeObserver(update)
-    observer.observe(element)
-    return () => observer.disconnect()
-  }, [expandedKey, items.length])
-
+  // Keep the list in normal flow. The old absolute-positioned virtual rows
+  // measured the expanded detail asynchronously; scrolling could unmount the
+  // measured node and leave the reserved height stale, causing rows to overlap.
+  // Timeline pages are bounded (50 days per page), so normal flow is simpler
+  // and stable.
   return (
     <div className="mind-scroll mind-timeline-scroll" ref={viewport}>
-      <div className="mind-spacer" style={{ height: total }}>
-        {items.slice(range.start, range.end).map((item, offset) => {
-          const index = range.start + offset
+      <div className="mind-timeline-flow">
+        {items.map(item => {
           const key = timelineKey(item)
           const expanded = key === expandedKey
           return (
-            <div
-              className="mind-row-abs"
-              key={key}
-              style={{ height: heights[index] ?? 72, top: offsets[index] ?? 0 }}
-            >
-              <div style={{ height: 72 }}>{renderRow(item, expanded)}</div>
-              {expanded ? <div ref={detailRef}>{renderDetail(item)}</div> : null}
+            <div className="mind-timeline-item" key={key}>
+              <div className="mind-timeline-summary">{renderRow(item, expanded)}</div>
+              {expanded ? <div className="mind-timeline-detail">{renderDetail(item)}</div> : null}
             </div>
           )
         })}
       </div>
+    </div>
+  )
+}
+
+function ReportBlock({ path }: { path: string }): ReactNode {
+  const [open, setOpen] = useState(false)
+  const state = useAsync<ReportText | null>(
+    signal => (open ? callApi<ReportText>('report', { path }, signal) : Promise.resolve(null)),
+    [path, open],
+  )
+
+  return (
+    <div className="mind-report-block">
+      <button
+        aria-expanded={open}
+        className="mind-btn mind-btn-ghost mind-report-toggle"
+        onClick={() => setOpen(value => !value)}
+        type="button"
+      >
+        <Chevron open={open} />
+        日报
+      </button>
+      {open ? (
+        state.loading ? (
+          <div className="mind-state">加载日报…</div>
+        ) : state.error !== null ? (
+          <ErrorBox message={state.error} onRetry={state.reload} />
+        ) : state.data === null ? null : (
+          <div className="mind-report-body">
+            <MarkdownPreview text={state.data.content} />
+          </div>
+        )
+      ) : null}
     </div>
   )
 }
@@ -510,6 +726,7 @@ function DayInline({
 
   return (
     <div className="mind-inline">
+      {row.reportPath === null ? null : <ReportBlock path={row.reportPath} />}
       {state.loading ? (
         <div className="mind-state">加载中…</div>
       ) : state.error !== null ? (
@@ -546,7 +763,7 @@ function DayInline({
 }
 
 function timelineKey(row: TimelineRow): string {
-  return `${row.date} ${row.workspaceId}`
+  return `${row.date}\u0000${row.workspaceId}`
 }
 
 function Timeline(): ReactNode {
@@ -556,26 +773,58 @@ function Timeline(): ReactNode {
   const [error, setError] = useState<string | null>(null)
   const [expandedKey, setExpandedKey] = useState<string | null>(null)
   const [expandedTurn, setExpandedTurn] = useState<string | null>(null)
+  const [workspaceFilter, setWorkspaceFilter] = useState('')
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([])
   const inFlight = useRef(false)
+  const requestId = useRef(0)
 
-  const loadPage = useCallback(async (before: TimelineCursor | null, replace: boolean) => {
-    if (inFlight.current) return
-    inFlight.current = true
-    if (replace) setLoading(true)
-    setError(null)
-    try {
-      const page = await callApi<TimelinePage>('timeline', before === null ? { limit: 50 } : { before, limit: 50 })
-      setRows(previous => (replace ? page.rows : mergeUnique(previous, page.rows)))
-      setNext(page.next)
-    } catch (caught) {
-      setError(messageOf(caught))
-    } finally {
-      inFlight.current = false
-      setLoading(false)
+  useEffect(() => {
+    let active = true
+    callApi<WorkspacesPage>('workspaces', { limit: 200 })
+      .then(page => {
+        if (active) setWorkspaces(page.rows)
+      })
+      .catch(() => {
+        // The selector is optional; the timeline still works without it.
+      })
+    return () => {
+      active = false
     }
   }, [])
 
+  const loadPage = useCallback(
+    async (before: TimelineCursor | null, replace: boolean) => {
+      const id = ++requestId.current
+      inFlight.current = true
+      if (replace) setLoading(true)
+      setError(null)
+      try {
+        const payload: Record<string, unknown> = before === null ? { limit: 50 } : { before, limit: 50 }
+        if (workspaceFilter !== '') payload.workspaceId = workspaceFilter
+        const page = await callApi<TimelinePage>('timeline', payload)
+        if (id !== requestId.current) return
+        setRows(previous => (replace ? page.rows : mergeUnique(previous, page.rows)))
+        setNext(page.next)
+      } catch (caught) {
+        if (id !== requestId.current) return
+        setError(messageOf(caught))
+      } finally {
+        if (id === requestId.current) {
+          inFlight.current = false
+          setLoading(false)
+        }
+      }
+    },
+    [workspaceFilter],
+  )
+
   useEffect(() => {
+    // A workspace switch invalidates the old page and any in-flight response.
+    inFlight.current = false
+    setRows([])
+    setNext(null)
+    setExpandedKey(null)
+    setExpandedTurn(null)
     void loadPage(null, true)
   }, [loadPage])
 
@@ -584,9 +833,20 @@ function Timeline(): ReactNode {
     void loadPage(next, false)
   }, [next, loadPage])
 
+  const workspaceOptions = useMemo(() => workspaceTreeOptions(workspaces), [workspaces])
+
   return (
     <div className="mind-main">
       <div className="mind-list-wrap">
+        <div className="mind-timeline-bar">
+          <span className="mind-timeline-bar-label">工作区</span>
+          <DshSelect
+            label="工作区"
+            onChange={next => setWorkspaceFilter(next === '__all__' ? '' : next)}
+            options={workspaceOptions}
+            value={workspaceFilter === '' ? '__all__' : workspaceFilter}
+          />
+        </div>
         {loading && rows.length === 0 ? (
           <div className="mind-state">加载中…</div>
         ) : error !== null ? (
@@ -609,10 +869,11 @@ function Timeline(): ReactNode {
               >
                 <RowIcon kind="calendar" />
                 <div className="mind-row-main">
-                  <div className="mind-row-title">{row.title === '' ? '（无标题）' : row.title}</div>
-                  <div className="mind-row-sub">
-                    {row.date} · {row.workspaceName}
+                  <div className="mind-row-title mind-day-title">
+                    <span className="mind-day-workspace">{workspaceLabel(row.workspaceName)}</span>
+                    <span className="mind-day-date">{` - ${row.date}`}</span>
                   </div>
+                  <div className="mind-row-sub">{row.title === '' ? '（无摘要）' : row.title}</div>
                 </div>
                 <div className="mind-row-meta">{row.turnCount} turns</div>
                 <Chevron open={isExpanded} />
@@ -633,10 +894,10 @@ function Timeline(): ReactNode {
 }
 
 function mergeUnique(previous: TimelineRow[], incoming: TimelineRow[]): TimelineRow[] {
-  const seen = new Set(previous.map(row => `${row.date} ${row.workspaceId}`))
+  const seen = new Set(previous.map(row => `${row.date}\u0000${row.workspaceId}`))
   const merged = [...previous]
   for (const row of incoming) {
-    const key = `${row.date} ${row.workspaceId}`
+    const key = `${row.date}\u0000${row.workspaceId}`
     if (!seen.has(key)) {
       seen.add(key)
       merged.push(row)
@@ -665,7 +926,7 @@ function DayDetail({ row, onClose }: { row: TimelineRow; onClose: () => void }):
         <div className="mind-detail-title">
           {turn === null ? row.date : (turn.title ?? turn.turnId)}
           <div className="mind-detail-sub">
-            {turn === null ? `${row.workspaceName} · ${row.turnCount} turns` : `Turn #${turn.turnSeq} · ${timeOf(turn.occurredAt)}`}
+            {turn === null ? `${workspaceLabel(row.workspaceName)} · ${row.turnCount} turns` : `Turn #${turn.turnSeq} · ${timeOf(turn.occurredAt)}`}
           </div>
         </div>
         <button className="mind-btn mind-btn-ghost" onClick={onClose} type="button">
@@ -774,10 +1035,8 @@ function TurnContent({ turn }: { turn: DayTurn }): ReactNode {
 // ---------------------------------------------------------------------------
 
 const LAYER_TITLES: Record<string, string> = {
-  project: '项目笔记',
-  whiteboard: '白板',
-  user: '用户规则',
   rule: '规则',
+  user: '规则',
 }
 
 function CurrentPage(): ReactNode {
@@ -810,45 +1069,48 @@ function CurrentPage(): ReactNode {
     )
   }
 
-  const groups = ['project', 'whiteboard', 'user', 'rule'].map(layer => ({
-    layer,
-    title: LAYER_TITLES[layer] ?? layer,
-    items: state.data?.entries.rows.filter(entry => entry.layer === layer) ?? [],
-  }))
+  const rules =
+    state.data?.entries.rows.filter(entry => entry.layer === 'rule' || entry.layer === 'user') ?? []
 
   return (
     <>
       <div className="mind-scroll">
         <div className="mind-page mind-page-body">
-          {groups.every(group => group.items.length === 0) ? (
-            <div className="mind-empty">还没有当前认知。批准提案后会出现在这里。</div>
+          {rules.length === 0 ? (
+            <div className="mind-empty">还没有规则。批准提案后会出现在这里。</div>
           ) : (
-            groups.map(group =>
-              group.items.length === 0 ? null : (
-                <Fragment key={group.layer}>
-                  <div className="mind-section-title">{group.title}</div>
-                  {group.items.map(entry => (
-                    <div
-                      className={`mind-row mind-item${entry.enabled ? '' : ' mind-disabled'}`}
-                      key={entry.id}
-                      onClick={() => setEditing(entry)}
-                    >
-                      <RowIcon kind={layerIcon(entry.layer)} />
-                      <div className="mind-row-main">
-                        <div className="mind-row-title">
-                          {entry.title}
-                          {entry.enabled ? null : <span className="mind-pill">已停用</span>}
-                        </div>
-                        <div className="mind-item-content">{entry.content}</div>
-                      </div>
-                      <div className="mind-row-meta">
-                        v{entry.version} · {entry.workspaceName} · {dateOf(entry.updatedAt)}
-                      </div>
+            <>
+              <div className="mind-section-title">规则</div>
+              {rules.map(entry => (
+                <div
+                  className={`mind-row mind-item${entry.enabled ? '' : ' mind-disabled'}`}
+                  key={entry.id}
+                  onClick={() => setEditing(entry)}
+                >
+                  <RowIcon kind="rule" />
+                  <div className="mind-row-main">
+                    <div className="mind-row-title">
+                      {entry.title}
+                      {entry.enabled ? null : <span className="mind-pill">已停用</span>}
                     </div>
-                  ))}
-                </Fragment>
-              ),
-            )
+                    <div className="mind-item-content">{entry.content}</div>
+                  </div>
+                  <div className="mind-row-meta">
+                    v{entry.version} ·{' '}
+                    {entry.workspaceId === null ? (
+                      <span className="mind-row-workspace-name mind-row-workspace-missing">
+                        未归属项目（请选择）
+                      </span>
+                    ) : (
+                      <span className="mind-row-workspace-name" title={workspaceLabel(entry.workspaceName)}>
+                        {workspaceLabel(entry.workspaceName)}
+                      </span>
+                    )}{' '}
+                    · {dateOf(entry.updatedAt)}
+                  </div>
+                </div>
+              ))}
+            </>
           )}
           {state.data.entries.truncated ? <div className="mind-state">条目过多，仅显示前 500 条。</div> : null}
         </div>
@@ -890,10 +1152,10 @@ function EntryEditor({
   const workspaceOptions = useMemo(() => {
     const options = workspaces.map(workspace => ({
       id: workspace.workspaceId,
-      name: workspace.displayName,
+      name: workspaceLabel(workspace.displayName),
     }))
     if (entry.workspaceId !== null && !options.some(option => option.id === entry.workspaceId)) {
-      options.push({ id: entry.workspaceId, name: entry.workspaceName })
+      options.push({ id: entry.workspaceId, name: workspaceLabel(entry.workspaceName) })
     }
     return options
   }, [entry.workspaceId, entry.workspaceName, workspaces])
@@ -903,12 +1165,16 @@ function EntryEditor({
       setError('标题不能为空')
       return
     }
+    if (workspaceId === '') {
+      setError('请先选择规则所属项目')
+      return
+    }
     setSaving(true)
     setError(null)
     try {
       await callApi('saveEntry', {
         id: entry.id,
-        layer: entry.layer,
+        layer: 'rule',
         title: title.trim(),
         content,
         enabled,
@@ -926,7 +1192,7 @@ function EntryEditor({
     <div className="mind-modal-mask" onMouseDown={event => event.target === event.currentTarget && onClose()}>
       <div className="mind-modal" role="dialog" aria-modal="true">
         <div className="mind-modal-header">
-          <span style={{ flex: 1 }}>编辑{LAYER_TITLES[entry.layer] ?? '条目'}</span>
+          <span style={{ flex: 1 }}>编辑规则</span>
           <span className="mind-setting-desc">v{entry.version}</span>
         </div>
         <div className="mind-modal-body">
@@ -943,21 +1209,28 @@ function EntryEditor({
           </div>
           <div className="mind-field">
             <label className="mind-field-label" htmlFor="mind-workspace">
-              类型
+              项目
             </label>
-            <select
-              className="mind-select"
+            <DshSelect
               id="mind-workspace"
-              onChange={event => setWorkspaceId(event.target.value)}
+              label="请选择项目"
+              onChange={setWorkspaceId}
+              options={[
+                ...(workspaceId === ''
+                  ? [{ id: '', label: '请选择项目' }]
+                  : []),
+                ...workspaceOptions.map(workspace => ({
+                  id: workspace.id,
+                  label: workspace.name,
+                })),
+              ]}
               value={workspaceId}
-            >
-              <option value="">全局</option>
-              {workspaceOptions.map(workspace => (
-                <option key={workspace.id} value={workspace.id}>
-                  项目 · {workspace.name}
-                </option>
-              ))}
-            </select>
+            />
+            {workspaceOptions.length === 0 ? (
+              <div className="mind-setting-desc">
+                还没有工作区。先在 DSH 里打开一个目录对话，再设置规则。
+              </div>
+            ) : null}
           </div>
           <div className="mind-field">
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -997,7 +1270,12 @@ function EntryEditor({
           <button className="mind-btn" disabled={saving} onClick={onClose} type="button">
             取消
           </button>
-          <button className="mind-btn mind-btn-primary" disabled={saving} onClick={() => void save()} type="button">
+          <button
+            className="mind-btn mind-btn-primary"
+            disabled={saving || workspaceId === '' || workspaceOptions.length === 0}
+            onClick={() => void save()}
+            type="button"
+          >
             {saving ? '保存中…' : '保存'}
           </button>
         </div>
@@ -1039,7 +1317,7 @@ function WorkspacesPage(): ReactNode {
             <div className="mind-row mind-item" key={workspace.workspaceId}>
               <RowIcon kind="workspace" />
               <div className="mind-row-main">
-                <div className="mind-row-title">{workspace.displayName}</div>
+                <div className="mind-row-title">{workspaceLabel(workspace.displayName)}</div>
                 <div className="mind-row-sub mind-mono">{primary?.path ?? '（无活动路径）'}</div>
                 <div className="mind-row-sub mind-mono">
                   {workspace.workspaceId}
@@ -1067,8 +1345,10 @@ function WorkspacesPage(): ReactNode {
 
 function ProposalsPage({ onPendingChange }: { onPendingChange: (count: number) => void }): ReactNode {
   const state = useAsync(signal => callApi<ProposalsPage>('proposals', { status: 'pending', limit: 200 }, signal), [])
+  const workspaceState = useAsync(signal => callApi<WorkspacesPage>('workspaces', {}, signal), [])
   const [acting, setActing] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [targets, setTargets] = useState<Record<string, string>>({})
 
   useEffect(() => {
     if (state.data !== null) onPendingChange(state.data.pendingCount)
@@ -1078,7 +1358,12 @@ function ProposalsPage({ onPendingChange }: { onPendingChange: (count: number) =
     setActing(proposal.id)
     setActionError(null)
     try {
-      await callApi('resolveProposal', { id: proposal.id, action })
+      const workspaceId = proposal.workspaceId ?? targets[proposal.id]
+      await callApi('resolveProposal', {
+        id: proposal.id,
+        action,
+        ...(workspaceId === undefined || workspaceId === '' ? {} : { workspaceId }),
+      })
       state.reload()
     } catch (caught) {
       setActionError(messageOf(caught))
@@ -1102,15 +1387,35 @@ function ProposalsPage({ onPendingChange }: { onPendingChange: (count: number) =
             <div className="mind-row-main">
               <div className="mind-row-title">{proposal.title}</div>
               <div className="mind-proposal-content">{proposal.content}</div>
+              {proposal.workspaceId === null ? (
+                <div className="mind-proposal-target">
+                  <DshSelect
+                    label="选择项目"
+                    onChange={next =>
+                      setTargets(current => ({ ...current, [proposal.id]: next }))
+                    }
+                    options={
+                      workspaceState.data?.rows.map(workspace => ({
+                        id: workspace.workspaceId,
+                        label: workspaceLabel(workspace.displayName),
+                      })) ?? []
+                    }
+                    value={targets[proposal.id] ?? ''}
+                  />
+                </div>
+              ) : null}
               <div className="mind-proposal-meta">
-                {proposal.workspaceName} · {dateOf(proposal.createdAt)}
+                {workspaceLabel(proposal.workspaceName)} · {dateOf(proposal.createdAt)}
                 {proposal.sourceTurn === null ? '' : ` · ${proposal.sourceTurn}`}
               </div>
             </div>
             <div className="mind-proposal-actions">
               <button
                 className="mind-btn mind-btn-primary"
-                disabled={acting === proposal.id}
+                disabled={
+                  acting === proposal.id ||
+                  (proposal.workspaceId === null && (targets[proposal.id] ?? '') === '')
+                }
                 onClick={() => void act(proposal, 'approve')}
                 type="button"
               >
@@ -1222,13 +1527,103 @@ function SettingsPage(): ReactNode {
   )
 }
 
+function ReportsPage(): ReactNode {
+  const workspaces = useAsync(
+    signal => callApi<WorkspacesPage>('workspaces', { limit: 500 }, signal),
+    [],
+  )
+  const [workspaceId, setWorkspaceId] = useState('')
+  const [selected, setSelected] = useState<PeriodRow | null>(null)
+
+  useEffect(() => {
+    setSelected(null)
+  }, [workspaceId])
+
+  const periods = useAsync<PeriodsPage | null>(
+    signal =>
+      workspaceId === ''
+        ? Promise.resolve(null)
+        : callApi<PeriodsPage>('reports', { workspaceId, kind: 'month', limit: 200 }, signal),
+    [workspaceId],
+  )
+  const report = useAsync<ReportText | null>(
+    signal =>
+      selected === null
+        ? Promise.resolve(null)
+        : callApi<ReportText>('report', { path: selected.reportPath }, signal),
+    [selected],
+  )
+
+  useEffect(() => {
+    if (selected === null && periods.data !== null && periods.data.rows.length > 0) {
+      setSelected(periods.data.rows[0] ?? null)
+    }
+  }, [periods.data, selected])
+
+  const options = workspaceTreeOptions(workspaces.data?.rows ?? [])
+
+  return (
+    <div className="mind-main">
+      <div className="mind-list-wrap">
+        <div className="mind-timeline-bar">
+          <span className="mind-timeline-bar-label">工作区</span>
+          <DshSelect
+            label="工作区"
+            onChange={setWorkspaceId}
+            options={options}
+            value={workspaceId}
+          />
+        </div>
+        {workspaceId === '' ? (
+          <div className="mind-empty">先选择一个工作区，再查看月报。</div>
+        ) : periods.loading ? (
+          <div className="mind-state">加载报告…</div>
+        ) : periods.error !== null ? (
+          <ErrorBox message={periods.error} onRetry={periods.reload} />
+        ) : periods.data === null || periods.data.rows.length === 0 ? (
+          <div className="mind-empty">这个工作区还没有月报。</div>
+        ) : (
+          <div className="mind-report-layout">
+            <div className="mind-report-list">
+              {periods.data.rows.map(period => (
+                <button
+                  className="mind-report-list-item"
+                  data-active={selected?.period === period.period}
+                  key={period.period}
+                  onClick={() => setSelected(period)}
+                  type="button"
+                >
+                  <span className="mind-report-period">{period.period}</span>
+                  <span className="mind-report-sub">{period.title}</span>
+                </button>
+              ))}
+            </div>
+            <div className="mind-report-view">
+              {selected === null ? (
+                <div className="mind-empty">选择一个月份查看月报。</div>
+              ) : report.loading ? (
+                <div className="mind-state">加载中…</div>
+              ) : report.error !== null ? (
+                <ErrorBox message={report.error} onRetry={report.reload} />
+              ) : report.data === null ? null : (
+                <MarkdownPreview text={report.data.content} />
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // App shell
 // ---------------------------------------------------------------------------
 
 const TABS: Array<{ id: Tab; label: string }> = [
   { id: 'timeline', label: '时间线' },
-  { id: 'current', label: '当前' },
+  { id: 'reports', label: '报告' },
+  { id: 'current', label: '规则' },
   { id: 'workspaces', label: '工作区' },
   { id: 'proposals', label: '提案' },
   { id: 'settings', label: '设置' },
@@ -1312,6 +1707,7 @@ export function MindApp(): ReactNode {
         </div>
       </div>
       {tab === 'timeline' ? <Timeline /> : null}
+      {tab === 'reports' ? <ReportsPage /> : null}
       {tab === 'current' ? <CurrentPage /> : null}
       {tab === 'workspaces' ? <WorkspacesPage /> : null}
       {tab === 'proposals' ? <ProposalsPage onPendingChange={setPending} /> : null}

@@ -119,27 +119,45 @@ describe('schema migration', () => {
   })
 })
 
+describe('rules-only migration', () => {
+  it('converts legacy user rules and retires project/whiteboard rows once', () => {
+    const dbPath = tempDb()
+    const store = new Store(dbPath)
+    store.upsertWorkspaceIdentity({ workspaceId: 'ws1', displayName: 'Demo' })
+    store.close()
+
+    const db = new sqlite.DatabaseSync(dbPath)
+    const insert = db.prepare(
+      `INSERT INTO cognition_entry(id, workspace_id, layer, title, conclusion, status, enabled, version, root_id, updated_at)
+       VALUES (?, 'ws1', ?, ?, 'x', 'current', 1, 1, 'default', '2026-10-19T00:00:00.000Z')`,
+    )
+    insert.run('legacy-project', 'project', 'project note')
+    insert.run('legacy-board', 'whiteboard', 'board item')
+    insert.run('legacy-user', 'user', 'user rule')
+    db.exec("DELETE FROM app_setting WHERE key = 'legacy_layers_migrated_v1'")
+    db.close()
+
+    const reopened = new Store(dbPath)
+    expect(reopened.getCognitionEntry('legacy-project')?.status).toBe('retired')
+    expect(reopened.getCognitionEntry('legacy-board')?.status).toBe('retired')
+    expect(reopened.getCognitionEntry('legacy-user')?.layer).toBe('rule')
+    expect(reopened.getSetting('legacy_layers_migrated_v1')).toBe('1')
+    reopened.close()
+  })
+})
+
 describe('injection scope', () => {
-  it('injects global and whiteboard entries, and skips disabled ones', () => {
+  it('injects enabled project rules and skips disabled ones', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mind-dsh-snapshot-'))
     dirs.push(dir)
     const store = new Store(path.join(dir, 'mind.db'))
     store.upsertWorkspaceIdentity({ workspaceId: 'ws1', displayName: 'Demo' })
     store.upsertCognitionEntry({
-      id: 'global-rule',
-      workspaceId: null,
-      layer: 'rule',
-      title: 'global rule',
-      conclusion: 'applies everywhere',
-      sourceRelPath: null,
-      rootId: 'default',
-    })
-    store.upsertCognitionEntry({
-      id: 'board',
+      id: 'rule-on',
       workspaceId: 'ws1',
-      layer: 'whiteboard',
-      title: 'board item',
-      conclusion: 'current focus',
+      layer: 'rule',
+      title: 'project rule',
+      conclusion: 'applies to this project',
       sourceRelPath: null,
       rootId: 'default',
     })
@@ -168,8 +186,7 @@ describe('injection scope', () => {
       localDate: '2026-10-19',
       dayBoundaryMinutes: 240,
     })
-    expect(snapshot).toContain('global rule')
-    expect(snapshot).toContain('board item')
+    expect(snapshot).toContain('project rule')
     expect(snapshot).not.toContain('disabled rule')
     expect(snapshot).toContain('日界 04:00')
     store.close()

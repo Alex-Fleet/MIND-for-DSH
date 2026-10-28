@@ -36,6 +36,30 @@ export function rebuildDayIndex(
   const title = pickTitle(rows, localDate)
   const reportRelPath = path.posix.join('projects', workspaceId, 'days', `${localDate}.md`)
 
+  // Migrated reports are curated source material. Never replace their text
+  // with a deterministic turn list just because a summary landed later.
+  const existing = store.getDayIndex(workspaceId, localDate)
+  const existingRel = String(existing?.report_rel_path ?? '')
+  if (
+    existing !== undefined &&
+    String(existing.root_id ?? '') === 'legacy' &&
+    existingRel !== '' &&
+    fs.existsSync(path.join(mindRoot, existingRel))
+  ) {
+    const sourceTurnIds = rows.map(row => String(row.turn_id))
+    const keptTitle = String(existing.title ?? title)
+    store.upsertDayIndex({
+      workspaceId,
+      localDate,
+      title: keptTitle,
+      turnCount: rows.length,
+      reportRelPath: existingRel,
+      rootId: 'legacy',
+      sourceTurnIds,
+    })
+    return { reportRelPath: existingRel, title: keptTitle, turnCount: rows.length, sourceTurnIds }
+  }
+
   const lines: string[] = [`# ${localDate} · ${title}`, '', `- 条目数: ${rows.length}`]
   if (summary !== undefined && summary.trim() !== '') {
     lines.push('', '## 摘要', '', summary.trim())
@@ -106,6 +130,24 @@ function rebuildPeriod(
     `${period}.md`,
   )
   const title = days.length > 0 ? String(days[0]?.title ?? period) : period
+
+  // Same rule for migrated month/week reports: preserve curated text.
+  const existing = store.getPeriodIndex(workspaceId, kind, period)
+  const existingRel = String(existing?.report_rel_path ?? '')
+  if (
+    existing !== undefined &&
+    Number(existing.legacy_synthesized ?? 0) === 1 &&
+    existingRel !== '' &&
+    fs.existsSync(path.join(mindRoot, existingRel))
+  ) {
+    return {
+      reportRelPath: existingRel,
+      title: String(existing.title ?? title),
+      sourceDayPaths: jsonArray(existing.source_day_rel_paths_json),
+      sourceTurnIds: jsonArray(existing.source_turn_ids_json),
+    }
+  }
+
   const lines: string[] = [`# ${period} · ${kind === 'week' ? '周报' : '月报'}`, '', `- 有记录天数: ${days.length}`, '', '## 每日']
 
   const sourceDayPaths: string[] = []

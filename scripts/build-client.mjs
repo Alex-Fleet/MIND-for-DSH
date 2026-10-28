@@ -9,7 +9,12 @@ const result = await build({
   platform: 'browser',
   target: 'es2022',
   jsx: 'automatic',
-  external: ['react', 'react/jsx-runtime', 'react-dom'],
+  external: [
+    'react',
+    'react/jsx-runtime',
+    'react-dom',
+    '@deepseek-ai/dsh-client-ui-primitives',
+  ],
   logLevel: 'silent',
 })
 

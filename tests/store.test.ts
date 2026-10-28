@@ -225,9 +225,19 @@ describe('Store', () => {
     store.close()
   })
 
-  it('requeues legacy dead jobs even when provider/model are null', () => {
+  it('requeues dead jobs for turns still waiting for a summary', () => {
     const store = tempStore()
     store.insertTurnAndJob(turn, [])
+    store.upsertTurnIndex({
+      turnId: 's1:1',
+      title: 'preview',
+      conclusion: '',
+      topics: [],
+      status: 'unsummarized',
+      sourceRelPath: turn.rawRelPath,
+      rootId: 'default',
+      occurredAt: turn.occurredAt,
+    })
     const sqlite = (process as unknown as { getBuiltinModule(id: string): typeof import('node:sqlite') })
       .getBuiltinModule('node:sqlite')
     const db = new sqlite.DatabaseSync(store.dbPath)
@@ -237,6 +247,31 @@ describe('Store', () => {
     expect(store.requeueSummaryFailures()).toBe(1)
     expect(store.listJobs('dead')).toHaveLength(0)
     expect(store.listJobs('pending')).toHaveLength(1)
+    store.close()
+  })
+
+  it('never requeues a migrated turn whose legacy summary was invalid', () => {
+    const store = tempStore()
+    store.insertTurnAndJob(turn, [])
+    store.upsertTurnIndex({
+      turnId: 's1:1',
+      title: 'preview',
+      conclusion: '',
+      topics: [],
+      status: 'unsummarized',
+      sourceRelPath: turn.rawRelPath,
+      rootId: 'default',
+      occurredAt: turn.occurredAt,
+    })
+    const sqlite = (process as unknown as { getBuiltinModule(id: string): typeof import('node:sqlite') })
+      .getBuiltinModule('node:sqlite')
+    const db = new sqlite.DatabaseSync(store.dbPath)
+    db.exec("UPDATE capture_job SET state = 'dead'")
+    db.exec("UPDATE turn_index SET status = 'invalid'")
+    db.close()
+
+    expect(store.requeueSummaryFailures()).toBe(0)
+    expect(store.listJobs('dead')).toHaveLength(1)
     store.close()
   })
 

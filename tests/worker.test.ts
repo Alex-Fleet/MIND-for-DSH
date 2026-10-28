@@ -17,7 +17,7 @@ afterEach(() => {
 function setup() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mind-dsh-worker-'))
   cleanup.push(dir)
-  const config = resolveConfig({ mindRoot: dir })
+  const config = resolveConfig({ mindRoot: dir, summarizeEnabled: true })
   const store = new Store(path.join(dir, 'mind.db'))
   const worker = new CaptureWorker(store, config)
   return { dir, config, store, worker }
@@ -114,17 +114,15 @@ describe('CaptureWorker', () => {
     store.close()
   })
 
-  it('does not write durable memory when the summary marks the turn as not worth remembering', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mind-dsh-worth-'))
+  it('writes only the turn index and never creates proposals', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mind-dsh-summary-index-'))
     cleanup.push(dir)
-    const config = resolveConfig({ mindRoot: dir })
+    const config = resolveConfig({ mindRoot: dir, summarizeEnabled: true })
     const store = new Store(path.join(dir, 'mind.db'))
     const worker = new CaptureWorker(store, config, async () => ({
       title: 'greeting',
       conclusion: 'hello',
       topics: [],
-      durable: [{ layer: 'project', title: 'should not persist', conclusion: 'x' }],
-      worthRemembering: false,
     }))
     const buffer = new TurnBuffer()
     buffer.push(session, { type: 'turn/start', time: Date.parse('2026-10-19T04:00:00Z'), data: { turn: 1 } })
@@ -142,9 +140,43 @@ describe('CaptureWorker', () => {
     worker.enqueue(finished, { workspaceId: 'ws1', rootId: 'default' })
     await worker.flush()
 
-    expect(store.listCognitionEntries('ws1', 'project')).toHaveLength(0)
+    expect(store.listCognitionEntries('ws1', 'rule')).toHaveLength(0)
     expect(store.listProposalsPage('pending', 10)).toHaveLength(0)
     expect(store.getTurnIndex('session-1:1')?.status).toBe('current')
+    worker.dispose()
+    store.close()
+  })
+
+  it('marks fallback indexes invalid and never calls the model when summarization is disabled', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mind-dsh-summary-off-'))
+    cleanup.push(dir)
+    const config = resolveConfig({ mindRoot: dir, summarizeEnabled: false })
+    const store = new Store(path.join(dir, 'mind.db'))
+    let called = false
+    const worker = new CaptureWorker(store, config, async () => {
+      called = true
+      return null
+    })
+    const buffer = new TurnBuffer()
+    buffer.push(session, { type: 'turn/start', time: Date.parse('2026-10-19T05:00:00Z'), data: { turn: 1 } })
+    buffer.push(session, {
+      type: 'user/message',
+      time: Date.parse('2026-10-19T05:00:01Z'),
+      data: { role: 'user', source: { kind: 'user' }, content: 'no summary' },
+    })
+    const finished = buffer.push(session, {
+      type: 'turn/end',
+      time: Date.parse('2026-10-19T05:00:02Z'),
+      data: { turn: 1, reason: { kind: 'completed' } },
+    })!
+
+    worker.enqueue(finished, { workspaceId: 'ws1', rootId: 'default' })
+    await worker.flush()
+
+    expect(called).toBe(false)
+    expect(store.getTurnIndex('session-1:1')?.status).toBe('unsummarized')
+    expect(store.listJobs('pending')).toHaveLength(0)
+    expect(store.listJobs('done')).toHaveLength(1)
     worker.dispose()
     store.close()
   })
@@ -152,7 +184,7 @@ describe('CaptureWorker', () => {
   it('keeps retrying a failed summary and keeps the turn visible', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mind-dsh-retry-'))
     cleanup.push(dir)
-    const config = resolveConfig({ mindRoot: dir })
+    const config = resolveConfig({ mindRoot: dir, summarizeEnabled: true })
     const store = new Store(path.join(dir, 'mind.db'))
     const worker = new CaptureWorker(store, config, async () => null)
     const buffer = new TurnBuffer()

@@ -81,6 +81,59 @@ describe('navigation views', () => {
     store.close()
   })
 
+  it('preserves a curated legacy day report when rebuilding', () => {
+    const { dir, store } = setup()
+    addTurn(store, 1, '2026-10-19', '新 turn')
+    const rel = 'projects/ws1/days/2026-10-19.md'
+    const file = path.join(dir, rel)
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, '# 2026-10-19 · 迁移原文\n\nCURATED-DAY', 'utf8')
+    store.upsertDayIndex({
+      workspaceId: 'ws1',
+      localDate: '2026-10-19',
+      title: '迁移原文',
+      turnCount: 1,
+      reportRelPath: rel,
+      rootId: 'legacy',
+      sourceTurnIds: ['s1:1'],
+    })
+
+    const view = rebuildDayIndex(store, dir, 'ws1', '2026-10-19', 'legacy')
+    expect(view.reportRelPath).toBe(rel)
+    expect(fs.readFileSync(path.join(dir, rel), 'utf8')).toContain('CURATED-DAY')
+    expect(store.getDayIndex('ws1', '2026-10-19')?.root_id).toBe('legacy')
+    store.close()
+  })
+
+  it('preserves a curated legacy month report when rebuilding', () => {
+    const { dir, store } = setup()
+    addTurn(store, 1, '2026-10-19', 'A')
+    rebuildDayIndex(store, dir, 'ws1', '2026-10-19', 'default')
+    const rel = 'projects/ws1/months/2026-10.md'
+    const file = path.join(dir, rel)
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, '# 2026-10 · 迁移原文\n\nCURATED-MONTH', 'utf8')
+    store.upsertPeriodIndex({
+      workspaceId: 'ws1',
+      kind: 'month',
+      period: '2026-10',
+      title: '迁移原文',
+      reportRelPath: rel,
+      rootId: 'legacy',
+      sourceDayPaths: ['projects/ws1/days/2026-10-19.md'],
+      sourceTurnIds: ['s1:1'],
+    })
+    // upsertPeriodIndex creates live rows; mark this one as migrated.
+    ;(store as unknown as { db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } } }).db
+      .prepare("UPDATE period_index SET legacy_synthesized = 1 WHERE workspace_id = 'ws1' AND kind = 'month' AND period = '2026-10'")
+      .run()
+
+    const view = rebuildMonthIndex(store, dir, 'ws1', '2026-10', 'legacy')
+    expect(view.reportRelPath).toBe(rel)
+    expect(fs.readFileSync(path.join(dir, rel), 'utf8')).toContain('CURATED-MONTH')
+    store.close()
+  })
+
   it('computes ISO week keys', () => {
     expect(isoWeek('2026-10-19')).toMatchObject({ key: '2026-W43', start: '2026-10-19', end: '2026-10-25' })
   })

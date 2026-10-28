@@ -1,6 +1,9 @@
 import crypto from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
 import type { PersistedSettings, ResolvedConfig } from '../config.js'
 import type { Store } from '../db/store.js'
+import { redactSecrets } from '../security/redact.js'
 import { readTurnPreview } from '../turns/preview.js'
 import { readTurnChunk } from '../turns/read.js'
 
@@ -10,6 +13,8 @@ export const UI_ENDPOINTS = [
   'turn',
   'current',
   'workspaces',
+  'reports',
+  'report',
   'proposals',
   'resolveProposal',
   'settings',
@@ -23,6 +28,8 @@ export interface UiDeps {
   store: Store
   config: ResolvedConfig
   saveSettings: (settings: PersistedSettings) => void
+  /** Pull renamed DSH workspace titles into MIND before reading names. */
+  refreshWorkspaceNames?: () => void
 }
 
 export interface UiErrorBody {
@@ -45,7 +52,7 @@ class UiError extends Error {
 }
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/
-const LAYERS = ['project', 'whiteboard', 'user', 'rule'] as const
+const LAYERS = ['rule'] as const
 const MAX_BODY_CHARS = 100_000
 const MAX_PAGE = 500
 
@@ -57,6 +64,8 @@ const HANDLERS: Record<UiEndpoint, Handler> = {
   turn: readTurn,
   current: readCurrent,
   workspaces: readWorkspaces,
+  reports: readReports,
+  report: readReport,
   proposals: readProposals,
   resolveProposal,
   settings: readSettings,
@@ -91,6 +100,7 @@ export async function handleUiRequest(
 // ---------------------------------------------------------------------------
 
 function readTimeline(deps: UiDeps, payload: Record<string, unknown>): unknown {
+  deps.refreshWorkspaceNames?.()
   const limit = boundedInt(payload.limit, 50, 1, MAX_PAGE)
   const before = optionalObject(payload.before)
   let beforeDate: string | null = null
@@ -100,7 +110,8 @@ function readTimeline(deps: UiDeps, payload: Record<string, unknown>): unknown {
     beforeWorkspaceId = requiredString(before.workspaceId, 'before.workspaceId', 200)
   }
 
-  const rows = deps.store.listDayPage(beforeDate, beforeWorkspaceId, limit + 1)
+  const workspaceFilter = optionalNullableString(payload.workspaceId, 'workspaceId', 200)
+  const rows = deps.store.listDayPage(beforeDate, beforeWorkspaceId, limit + 1, workspaceFilter)
   const page = rows.slice(0, limit)
   const last = page.at(-1)
   return {
@@ -143,6 +154,41 @@ function readDay(deps: UiDeps, payload: Record<string, unknown>): unknown {
   }
 }
 
+function readReports(deps: UiDeps, payload: Record<string, unknown>): unknown {
+  deps.refreshWorkspaceNames?.()
+  const workspaceId = requiredString(payload.workspaceId, 'workspaceId', 200)
+  const kind = requiredOneOf(payload.kind ?? 'month', ['week', 'month'] as const, 'kind')
+  const limit = boundedInt(payload.limit, 200, 1, MAX_PAGE)
+  const rows = deps.store.listPeriods(workspaceId, kind, limit + 1)
+  return {
+    workspaceId,
+    kind,
+    truncated: rows.length > limit,
+    rows: rows.slice(0, limit).map(row => ({
+      workspaceId: String(row.workspace_id ?? ''),
+      kind: String(row.kind ?? kind),
+      period: String(row.period ?? ''),
+      title: String(row.title ?? ''),
+      reportPath: String(row.report_rel_path ?? ''),
+    })),
+  }
+}
+
+function readReport(deps: UiDeps, payload: Record<string, unknown>): unknown {
+  const relative = requiredString(payload.path, 'path', 500)
+  const root = path.resolve(deps.config.mindRoot)
+  const target = path.resolve(root, relative)
+  if (!target.startsWith(root + path.sep)) {
+    throw new UiError('bad-request', 'report path escapes the MIND root')
+  }
+  try {
+    const content = fs.readFileSync(target, 'utf8')
+    return { path: relative, content: redactSecrets(content) }
+  } catch {
+    throw new UiError('not-found', `report not found: ${relative}`)
+  }
+}
+
 function readTurn(deps: UiDeps, payload: Record<string, unknown>): unknown {
   const turnId = requiredString(payload.turnId, 'turnId', 500)
   const offset = boundedInt(payload.offset, 0, 0, Number.MAX_SAFE_INTEGER)
@@ -156,6 +202,7 @@ function readTurn(deps: UiDeps, payload: Record<string, unknown>): unknown {
 }
 
 function readCurrent(deps: UiDeps, payload: Record<string, unknown>): unknown {
+  deps.refreshWorkspaceNames?.()
   const limit = boundedInt(payload.limit, 300, 1, MAX_PAGE)
   const workspaceFilter = optionalNullableString(payload.workspaceId, 'workspaceId', 200)
   const rows = deps.store.listAllCognitionEntries(limit + 1, workspaceFilter)
@@ -169,7 +216,7 @@ function readCurrent(deps: UiDeps, payload: Record<string, unknown>): unknown {
             ? '全局'
             : String(row.workspace_id)
           : String(row.display_name),
-      layer: String(row.layer ?? 'project'),
+      layer: String(row.layer ?? 'rule'),
       title: String(row.title ?? ''),
       content: String(row.conclusion ?? ''),
       enabled: Number(row.enabled ?? 1) === 1,
@@ -182,6 +229,7 @@ function readCurrent(deps: UiDeps, payload: Record<string, unknown>): unknown {
 }
 
 function readWorkspaces(deps: UiDeps, payload: Record<string, unknown>): unknown {
+  deps.refreshWorkspaceNames?.()
   const limit = boundedInt(payload.limit, 200, 1, MAX_PAGE)
   const workspaces = deps.store.listWorkspaces(limit + 1)
   const locations = deps.store.listAllLocations(2_001)
@@ -214,6 +262,7 @@ function readWorkspaces(deps: UiDeps, payload: Record<string, unknown>): unknown
 }
 
 function readProposals(deps: UiDeps, payload: Record<string, unknown>): unknown {
+  deps.refreshWorkspaceNames?.()
   const status = optionalOneOf(payload.status, ['pending', 'approved', 'rejected', 'all'] as const, 'status') ?? 'pending'
   const limit = boundedInt(payload.limit, 200, 1, MAX_PAGE)
   const rows = deps.store.listProposalsPage(status === 'all' ? null : status, limit + 1)
@@ -239,8 +288,26 @@ function resolveProposal(deps: UiDeps, payload: Record<string, unknown>): unknow
   const id = requiredString(payload.id, 'id', 200)
   const action = requiredOneOf(payload.action, ['approve', 'reject'] as const, 'action')
   const reason = optionalNullableString(payload.reason, 'reason', 500) ?? null
+  const workspaceId = optionalNullableString(payload.workspaceId, 'workspaceId', 200)
+  const proposal = deps.store.getProposal(id)
+  if (proposal === undefined) throw new UiError('not-found', `proposal not found: ${id}`)
+  if (
+    action === 'approve' &&
+    (proposal.workspace_id === null ||
+      proposal.workspace_id === undefined ||
+      proposal.workspace_id === '') &&
+    (workspaceId === null || workspaceId === undefined || workspaceId === '')
+  ) {
+    throw new UiError('bad-request', '该提案没有关联项目，请先选择一个项目')
+  }
   try {
-    return deps.store.resolveProposal({ id, action, reviewer: 'ui', reason })
+    return deps.store.resolveProposal({
+      id,
+      action,
+      reviewer: 'ui',
+      reason,
+      ...(workspaceId === undefined ? {} : { workspaceId }),
+    })
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     const code = message.startsWith('proposal not found')
@@ -307,6 +374,9 @@ function saveEntry(deps: UiDeps, payload: Record<string, unknown>): unknown {
       : typeof existing.workspace_id === 'string'
         ? existing.workspace_id
         : null
+    if (workspaceId === null) {
+      throw new UiError('bad-request', '规则必须属于一个项目')
+    }
 
     const updated = deps.store.updateCognitionEntry({ id, workspaceId, layer, title, conclusion: content, enabled })
     if (!updated) throw new UiError('conflict', `entry is not editable: ${id}`)
@@ -318,6 +388,9 @@ function saveEntry(deps: UiDeps, payload: Record<string, unknown>): unknown {
   if (title === '') throw new UiError('bad-request', 'title must not be empty')
   const content = optionalString(payload.content, 'content', MAX_BODY_CHARS) ?? ''
   const workspaceId = optionalNullableString(payload.workspaceId, 'workspaceId', 200) ?? null
+  if (workspaceId === null) {
+    throw new UiError('bad-request', '规则必须属于一个项目')
+  }
   const enabled = optionalBoolean(payload.enabled, 'enabled') ?? true
 
   const createdId = `cog-${crypto.randomUUID()}`
