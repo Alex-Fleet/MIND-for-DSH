@@ -1,5 +1,7 @@
 # Agent R&D 结构迁移与 DSH 记忆迁移计划
 
+> **已归档（2026-10-29）**：本文是 2026-10-24 的迁移计划与执行记录。阶段一已收口；阶段二（MIND-for-Claude 清理）由用户自行维护，不属于本仓库。当前状态、迁移遗留与实现偏差见 [known-issues-2026-10-29.md](known-issues-2026-10-29.md)。
+
 - 状态：草案，待确认
 - 日期：2026-10-24
 - 范围：`Agent R&D/` 下全部项目；`MIND-for-Claude`（原 `Memory Plugin`）；`MIND-for-DSH`

@@ -587,6 +587,23 @@ export class Store {
       .all(limit) as Array<Record<string, unknown>>
   }
 
+  /**
+   * Every raw path already represented in the database.
+   *
+   * The startup orphan scan must treat a raw file as recovered when *any* turn
+   * row points at it. Migrated legacy turns use a `legacy-<session>-<seq>` id,
+   * so looking only at `<session>:<seq>` would re-ingest the same file as a
+   * second turn, duplicate the day counts, and re-summarize it.
+   */
+  listRawPaths(): Set<string> {
+    const rows = this.db
+      .prepare('SELECT raw_rel_path FROM turns WHERE raw_rel_path IS NOT NULL')
+      .all() as Array<{ raw_rel_path: string }>
+    const paths = new Set<string>()
+    for (const row of rows) paths.add(row.raw_rel_path)
+    return paths
+  }
+
   getTurnIndex(turnId: string): Record<string, unknown> | undefined {
     return this.db.prepare('SELECT * FROM turn_index WHERE turn_id = ?').get(turnId) as Record<string, unknown> | undefined
   }

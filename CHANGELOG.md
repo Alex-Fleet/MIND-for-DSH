@@ -18,6 +18,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - `mind_remember` model tool: the main agent can record a durable project rule as a pending proposal for user review; it never activates a rule directly.
 - `user-profile.md` is now part of the static standards section, injected alongside behavior/programming/checklists-index.
 - `exps-index.md` is injected as an advisory engineering-experience index; the full exps files stay on-demand and are explicitly not mandatory rules.
+- `npm run doctor` (`scripts/doctor.mjs`): read-only profile health check (bundle entry, `node_modules` link, lockfile specifier, build freshness) with `--fix` to relink and repair the manifest/lockfile. Guards against the post-move/post-update failure where `pnpm add` re-materialises a stale `link:` path and DSH silently drops the bundle.
 
 ### Changed
 
@@ -39,9 +40,11 @@ All notable changes to this project are documented here. The format follows [Kee
 - The timeline expands inline (56px indent, rounded inset highlight, no side pane, no hard guide line).
 - Day index refresh is cheap at capture; full views are rebuilt on summary/startup; increments use the last main turn query.
 - Dev dependencies aligned to DSH `0.2.1-rc.2`.
+- Documentation synced to the 2026-10-29 state: README (status, pages, data, standards provisioning), UI-DESIGN (accepted status, report page, settings scope, weekly removal), ARCHITECTURE (legacy raw caveat, marker/volume-UUID state, snapshot cache caveat) and the archived migration plan.
 
 ### Fixed
 
+- Startup orphan reconciliation no longer re-ingests a raw turn file that any turn row already points at. Migrated legacy turns use `legacy-<session>-<seq>` ids, so the scan (which only looked for `<session>:<seq>`) used to insert a duplicate row and re-summarize it on plugin load — 200 per load, inflating day counts and duplicating history. The scan now dedupes by `raw_rel_path` before reading the file; genuinely orphaned raws are still recovered. Existing duplicate rows are left untouched (see [docs/known-issues-2026-10-29.md](docs/known-issues-2026-10-29.md) A1).
 - Restart no longer re-queues migrated turns that never had a summary. `requeueSummaryFailures()` now only re-arms jobs whose `turn_index.status` is `unsummarized`, so the 376 legacy turns (2026-09-24 … 09-26) that were marked `unsummarized` by the migration stopped being re-summarized on every restart; they are now `invalid` and permanently parked. Disabling summarization also marks new turns `unsummarized` (paused, resumable) instead of `invalid` (never resumed), keeping the two cases distinct.
 - Restored curated daily/monthly reports that had been overwritten by deterministic view rebuilds; the files now come from the legacy `nailong.db` source and are protected by legacy markers.
 - Missing day reports are materialized immediately after a turn is ingested, so today's timeline is readable before summaries finish.
@@ -92,7 +95,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Known deferred
 
-- The three standards files are not shipped with the plugin; provisioning is deferred to the migration step by user decision.
+- Migration residue (duplicate legacy turns from re-ingestion, legacy raw files that are old MIND summaries, inflated day counts) and implementation deviations (snapshot cache key without a date, volume-UUID fallback, marker never written, search not filtering status) are catalogued in [docs/known-issues-2026-10-29.md](docs/known-issues-2026-10-29.md). Migration-caused items are recorded and intentionally **not fixed** (they do not affect new conversations); non-migration items are pending scheduling.
 - Full session-log recovery sweep (more than 200 sessions, balanced interrupted closers) and atomic turn-directory event ordering are deferred to a separate design.
 - A single credential larger than roughly 4 MB could cross the redaction window; normal keys/tokens are far smaller.
 

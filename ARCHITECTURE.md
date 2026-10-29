@@ -49,7 +49,7 @@ UI (Client)
 
 ## 关键不变量
 
-1. **原文全量保留**：`projects/.../turns/*.md` 是可读原文；同名 `.events.jsonl` 保存每个 session 事件的完整 payload（含 system/message、assistant/attempt、工具结果等）。两者都是本地事实源。
+1. **原文全量保留**：`projects/.../turns/*.md` 是可读原文；同名 `.events.jsonl` 保存每个 session 事件的完整 payload（含 system/message、assistant/attempt、工具结果等）。两者都是本地事实源。迁移的 legacy turn 是例外：约 71% 的 `.md` 是旧 MIND 的摘要记录而非对话转录，完整原始事件仍在 `.events.jsonl`（`legacy/message` 的 `raw` 字段）——见 `docs/known-issues-2026-10-29.md` A2。
 2. **摘要只做索引**：`turn_index` 存标题、一句结论、主题和原始路径；不生成摘要的摘要。
 3. **摘要默认开启**：`summarizeEnabled=true`（默认）。摘要是这套记忆模型的索引层，不是可选项：每个 turn 落盘时先写 fallback 索引（用户首行 preview），随后一次辅助模型调用把它升级为 `current`（标题 + 一句结论 + 主题 + 原文路径）。失败按退避永久重试，fallback 索引保证时间线、FTS 和视图不丢 turn。旧库里本来就是 `invalid`/`merged` 的迁移数据保持 `invalid`，不补摘要——那是迁移数据的属性，不是新 turn 的常态。`summarizeEnabled=false` 只是显式降级开关：保留 fallback 索引并标 `invalid`，不调用模型。
 4. **摘要队列**：失败按 5s → 15m → 30m 退避并永久重试，优先处理最近 turn；关闭时启动恢复把 pending/running 任务直接完成，不再调用模型。
@@ -65,8 +65,8 @@ UI (Client)
    - 时间轴：最近 30 天，每天一行（日期 · 标题 · turn 数 · 日报路径）；
    - 日期行（北京时间 + 日界）。
    各 section 内部按 **旧 → 新** 排列；段与段之间按「稳定 → 易变」排列：项目规则 → 月报（全部历史）→ 日报（21 天窗口）→ turns（最近 7 天）→ 时间轴（30 天）→ 日期。日期行和时间轴每天都变，必须留在最末，否则它们一变化就会作废后面几万字的缓存。快照生成后同一 session 不再因新 turn 重新追加整份内容。
-10. **快照缓存有两个失效条件**：缓存 key 是 `sessionId : workspaceId : ruleStamp`。`ruleStamp` 由该工作区启用规则的条数、`MAX(updated_at)` 和 `SUM(version)` 组成，因此批准、编辑或停用一条规则会让 key 变化，下一轮就重拍——不需要 UI 知道当前是哪个会话。另一个条件是压缩：收到 `compaction/end`（无 `error`，手动或自动）或 `compaction/prune` 时，删掉该 session 的快照缓存，下一轮从磁盘重拍；压缩失败不重拍。
-11. **工作区身份不依赖路径**：路径只是位置；身份由 inode / 标记 / git 回退确定；快照和 capture 按当前 session 的缓存解析，缺 cwd 的 session 不会借用其他 session 的工作区；恢复时路径失效优先查历史 path（含 realpath/符号链接变体），而不是新造路径 hash。`workspace_path_history` 每个 `(workspace, path)` 只保留一行，有 unique 约束和 path 索引；重复 ingest 只有在已有值是 `orphan` 时才接受更准确的工作区。
+10. **快照缓存有两个失效条件**：缓存 key 是 `sessionId : workspaceId : ruleStamp`。`ruleStamp` 由该工作区启用规则的条数、`MAX(updated_at)` 和 `SUM(version)` 组成，因此批准、编辑或停用一条规则会让 key 变化，下一轮就重拍——不需要 UI 知道当前是哪个会话。另一个条件是压缩：收到 `compaction/end`（无 `error`，手动或自动）或 `compaction/prune` 时，删掉该 session 的快照缓存，下一轮从磁盘重拍；压缩失败不重拍。**已知偏差**：key 不含 `localDate`，跨 04:00 日界线的会话不会重拍（见 `docs/known-issues-2026-10-29.md` B1）。
+11. **工作区身份不依赖路径**：路径只是位置；身份由 `(卷, inode)` 主键 + git 回退确定（marker 写入开关当前未启用，生产不写 `.mind/workspace-id`；卷标识当前退化为设备号，见 `docs/known-issues-2026-10-29.md` B2/B3）；快照和 capture 按当前 session 的缓存解析，缺 cwd 的 session 不会借用其他 session 的工作区；恢复时路径失效优先查历史 path（含 realpath/符号链接变体），而不是新造路径 hash。`workspace_path_history` 每个 `(workspace, path)` 只保留一行，有 unique 约束和 path 索引；重复 ingest 只有在已有值是 `orphan` 时才接受更准确的工作区。
 12. **安全边界**：MIND 自有目录和文件（DB/WAL/SHM/settings/视图/旧 raw）0700/0600，但自定义 mindRoot 若不是新的、带标记的或已有的 `.../mind` 库，不递归 chmod 无关内容；摘要/提案/快照/增量/工具输出统一脱敏，覆盖 JSON 引号键（含复合/驼峰键和转义值）、赋值值（特殊字符/短口令/裸 env 名）、Basic（Authorization 上下文、base64url）、短 Bearer、JWT、PGP/私钥；分块读取用 4 MB 重叠窗口和显式 marker 段防止凭证跨边界泄漏，且不误伤 `getToken()`/`process.env`/`config.*` 这类代码引用；UI 写路径最小（条目编辑、提案审核、两个开关）。
 13. **模型继承**：同一 session 后续 turn 没有 `request/header` 时，先查进程内缓存，再查数据库最近一次已知 provider/model；重启、热重载和 raw 恢复都覆盖。重复 ingest 不覆盖已经记录的 provider/model。摘要的 provider/model 配置作为一个整体：只配置其中一项时，另一项使用默认值，不与 turn 的模型混搭。
 14. **规则生命周期**：同一工作区的同一条规则跨 turn 去重（pending/approved/current 都算命中）；旧 `user` 层一次性转 `rule`，旧 `project`/`whiteboard` 行标 `retired` 保留但不再可见/注入。项目规则全量注入，不设条数/字数截断。UI 所有下拉都用 DSH `Menu` 原语，trigger 必须作为 Menu 的子节点，原生 select 只做 primitives 缺失兜底；规则必须显式选择工作区。
@@ -75,6 +75,7 @@ UI (Client)
 
 - 崩溃恢复仍只扫描前 200 个持久会话，且只找回最后一个未闭合 turn；DSH resume 追加的 `interrupted` closer 造成的 balanced-but-missing turn 尚未覆盖。
 - `.events.jsonl` 不含 `turn/start` / `turn/end` 的原始 payload；`.md` 与 `.events.jsonl` 两次写入之间存在崩溃窗口。
+- 迁移遗留与实现偏差集中记录在 [docs/known-issues-2026-10-29.md](docs/known-issues-2026-10-29.md)：重复 turn 已于 2026-10-29 在启动对账里按 `raw_rel_path` 去重（不再新增，历史 3,800 条待清理）；其余迁移项按用户决定只记录、不修复（不影响新对话）；非迁移项待后续排期。
 
 ## Schema
 

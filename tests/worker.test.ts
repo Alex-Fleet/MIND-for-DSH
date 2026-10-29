@@ -401,6 +401,69 @@ describe('CaptureWorker', () => {
     store.close()
   })
 
+  it('does not re-ingest a legacy turn whose raw file is already represented', () => {
+    const { dir, store, worker } = setup()
+    const localDate = '2026-09-26'
+    const sessionId = 'sess-legacy'
+    const seq = 42
+    const dateDir = path.join(dir, 'projects', 'ws1', 'turns', localDate)
+    fs.mkdirSync(dateDir, { recursive: true })
+    const file = path.join(dateDir, `legacy-${sessionId}-${seq}.md`)
+    fs.writeFileSync(
+      file,
+      [
+        `# Turn ${sessionId} / #${seq}`,
+        '',
+        '- 开始: 2026-09-26T01:00:00.000Z',
+        '- 结束: 2026-09-26T01:00:01.000Z',
+        '- 结束原因: legacy_import',
+        '- 来源: main',
+        '- 工作区: /tmp/ws',
+        '',
+        '## 用户',
+        '',
+        'hello',
+        '',
+      ].join('\n'),
+    )
+    const relative = path.relative(dir, file).split(path.sep).join('/')
+    store.ingestTurn(
+      {
+        turnId: `legacy-${sessionId}-${seq}`,
+        workspaceId: 'ws1',
+        // Migration keeps the legacy marker in session_id; a second ingest
+        // would use the bare session id and create `<session>:<seq>`.
+        sessionId: `legacy-${sessionId}`,
+        turnSeq: seq,
+        origin: 'main',
+        endReason: 'legacy_import',
+        occurredAt: '2026-09-26T01:00:00.000Z',
+        localDate,
+        rootId: 'default',
+        rawRelPath: relative,
+        provider: null,
+        model: null,
+      },
+      [],
+      {
+        title: 'legacy',
+        conclusion: '',
+        topics: [],
+        status: 'unsummarized',
+        sourceRelPath: relative,
+        rootId: 'default',
+        occurredAt: '2026-09-26T01:00:00.000Z',
+      },
+    )
+
+    expect(worker.reconcileRawTurns(200)).toBe(0)
+    expect(store.getTurn(`${sessionId}:${seq}`)).toBeUndefined()
+    expect(store.countTurns()).toBe(1)
+
+    worker.dispose()
+    store.close()
+  })
+
   it('inherits the last persisted model after a worker restart', async () => {
     const { config, store, worker } = setup()
     const first = {

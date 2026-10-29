@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "MIND for DSH — full-fidelity, navigable memory for DeepSeek Harness",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Alex-Fleet/MIND-for-DSH.git"
+  },
+  "homepage": "https://github.com/Alex-Fleet/MIND-for-DSH#readme",
+  "bugs": {
+    "url": "https://github.com/Alex-Fleet/MIND-for-DSH/issues"
+  },
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -31,7 +39,8 @@
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
     "build:host": "tsc -p tsconfig.json",
     "build:client": "node scripts/build-client.mjs",
-    "prepublishOnly": "npm run build",
+    "prepare": "npm run build",
+    "doctor": "node scripts/doctor.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"

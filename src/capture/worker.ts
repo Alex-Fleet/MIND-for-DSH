@@ -282,6 +282,10 @@ export class CaptureWorker {
     // count toward the limit, so existing files cannot starve a later orphan;
     // one corrupt file must not abort the rest of the scan.
     let inserted = 0
+    // A raw file already represented by *any* turn row is not an orphan.
+    // Legacy migration used `legacy-<session>-<seq>` ids, so checking only
+    // `<session>:<seq>` would re-ingest the same file as a duplicate turn.
+    const knownRawPaths = this.store.listRawPaths()
     outer:
     for (const workspaceEntry of sortedEntries(base)) {
       if (!workspaceEntry.isDirectory()) continue
@@ -295,6 +299,10 @@ export class CaptureWorker {
         for (const fileEntry of sortedEntries(dateDir)) {
           if (inserted >= limit) break outer
           if (!fileEntry.isFile() || !fileEntry.name.endsWith('.md') || fileEntry.name.includes('.tmp-')) continue
+          const relative = path.posix.join('projects', workspaceId, 'turns', localDate, fileEntry.name)
+          // Skip before opening the file: a normal startup scans tens of
+          // thousands of already-known paths, and none of them need a read.
+          if (knownRawPaths.has(relative)) continue
           const full = path.join(dateDir, fileEntry.name)
           const header = readRawHeader(full)
           if (header === null) continue
@@ -311,7 +319,6 @@ export class CaptureWorker {
           } catch {
             continue
           }
-          const relative = path.relative(this.config.mindRoot, full).split(path.sep).join('/')
           const eventsPath = full.replace(/\.md$/, '.events.jsonl')
           const events = readEventsFile(eventsPath, parseTimestamp(header.occurredAt))
           const startedAt = parseTimestamp(header.occurredAt)
@@ -388,6 +395,7 @@ export class CaptureWorker {
             continue
           }
           inserted += 1
+          knownRawPaths.add(relative)
           days.set(`${workspaceId}|${localDate}`, { workspaceId, localDate, rootId })
         }
       }
