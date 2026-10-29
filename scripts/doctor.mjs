@@ -223,6 +223,18 @@ if (fix) {
     console.log('  skip   node_modules/mind-dsh is missing; reinstall it from its package source')
   }
 
+  if (localSpec === null && realpathOrNull(linkPath) !== null) {
+    // A package copy can inherit a nested node_modules from an older build
+    // (`prepare` installs devDependencies inside the package). Those copies
+    // shadow the host's @deepseek-ai packages, so drop them.
+    const nestedDir = path.join(linkPath, 'node_modules')
+    if (fs.existsSync(path.join(nestedDir, '@deepseek-ai'))) {
+      fs.rmSync(nestedDir, { recursive: true, force: true })
+      console.log('  fixed  removed nested node_modules from the installed copy')
+      changed = true
+    }
+  }
+
   if (Array.isArray(bundles) && !bundles.includes('mind-dsh')) {
     const copy = backup(manifestPath)
     const index = bundles.findIndex(name => name === '@deepseek-ai/dsh-experimental-voice-input-bundle')
