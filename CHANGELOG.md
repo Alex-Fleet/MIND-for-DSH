@@ -22,6 +22,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Changed
 
+- `npm run doctor` now accepts both install modes: a `link:` checkout (verifies the symlink target) and a package copy from GitHub/npm (verifies the installed package name, version and `dsh.bundle.patch`, and never converts a package install back into a link).
 - LLM turn summarization is on by default (`summarizeEnabled=true`): the summary is the index layer, so a turn without one only has a fallback preview. `summarizeEnabled=false` remains an explicit degradation switch. Migrated turns that were already `invalid`/`merged` in the legacy DB stay `invalid` and are not re-summarized.
 - The frozen snapshot is rebuilt when the workspace's rule set changes: the cache key now carries a rule stamp (count + latest update + summed versions), so an approved rule is visible in the next turn of the same session.
 - The frozen snapshot is also rebuilt after a successful compaction or prune (`compaction/end` without an error, or `compaction/prune`); a failed compaction does not trigger it.

@@ -70,20 +70,20 @@ dsh plugin --profile web add /absolute/path/to/MIND-for-DSH
 
 `cordis.patch.yml` 的 `config` 接受：`mindRoot`、`captureEnabled`、`injectEnabled`、`uiEnabled`、`standardsDir`、`dayBoundaryMinutes`、`workerIntervalMs`、`summarizeEnabled`、`turnSummaryChars`、`summaryProvider`、`summaryModel` 等。UI 里只暴露捕获/注入两个开关并写入 `settings.json`；摘要开关与预算按用户决定只走配置文件（改动成本本身是保护）。
 
-## 运维：更新 DSH、移动仓库或装卸插件之后
+## 安装方式与运维
 
-`mind-dsh` 以 `link:` 方式装进 profile，解析结果记在 profile 的 `pnpm-lock.yaml` 里。**仓库路径变了而 lockfile 没跟着改**时，下一次 `pnpm add`（装/卸任何插件都会触发）会把 `node_modules/mind-dsh` 重链到旧路径；DSH 插件管理器发现解析不到 `dsh.bundle`，会静默把它从 `dsh.profile.bundles` 里剔除——但运行中的进程还留着已加载的模块，所以要到下次重启才暴露。
+日常安装用 **GitHub 包**：profile 里记的是 `github:Alex-Fleet/MIND-for-DSH#<commit>`，`node_modules/mind-dsh` 是一份拷贝，和仓库路径无关。装/卸别的插件、移动仓库、重启都不会影响它。更新时用插件管理器添加新 commit；它会询问是否允许 `prepare` 构建，允许后自动写 `allowBuilds`。不建议绕过插件管理器直接用裸 `pnpm add`。
 
-症状：更新/重启后「记忆」页消失、没有 `<mind_memory>` 注入、时间线停止增长。
-
-检查与修复：
+开发时用 `link:` 指向工作目录（改动即时生效）。这份安装会随仓库路径变化，移动仓库或装/卸插件后要跑一次自检。
 
 ```sh
-npm run doctor          # 只读：检查 bundle 条目、链接、lockfile、构建新鲜度
-npm run doctor -- --fix # 修复链接 / bundle 列表 / lockfile（自动备份）
+npm run doctor          # 只读检查
+npm run doctor -- --fix # 只对 link 安装重链；同时修 bundle 列表与 lockfile
 ```
 
-修复后重启 DSH，再跑一次 `npm run doctor` 确认 `RESULT: healthy`。非 `desktop` profile 用 `--profile=<name>`。移动仓库时，`package.json` 和 `pnpm-lock.yaml` 必须同时更新——`--fix` 能修 lockfile，但不会替你移动仓库。
+`doctor` 同时认两种安装：`link:` 安装检查链接是否指向当前仓库；GitHub/npm 包安装检查拷贝的包名、版本和 `dsh.bundle.patch`。非 `desktop` profile 用 `--profile=<name>`。
+
+故障排查：更新/重启后「记忆」页消失、没有 `<mind_memory>` 注入、时间线停止增长——先跑 `npm run doctor`。link 安装被旧路径打断时，`--fix` 会重链并修正 lockfile，然后重启；包安装缺文件时，用插件管理器重装同一个 commit。
 
 ## 开发
 

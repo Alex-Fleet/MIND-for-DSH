@@ -112,31 +112,34 @@ if (!Array.isArray(bundles)) {
 }
 
 const dependency = manifest?.dependencies?.['mind-dsh']
+const localSpec = typeof dependency === 'string' ? parseLocalSpec(dependency, profileDir) : null
 if (typeof dependency !== 'string') {
   fail('dependencies["mind-dsh"] is missing')
+} else if (localSpec === null) {
+  pass(`dependencies["mind-dsh"] uses a package spec: ${dependency}`)
+} else if (realpathOrNull(localSpec) === repoRoot) {
+  pass('dependencies["mind-dsh"] points at this checkout')
 } else {
-  const target = parseLocalSpec(dependency, profileDir)
-  if (target === null) {
-    warn(`dependencies["mind-dsh"] is not a link:/file: spec (${dependency}); this checkout is not the installed source`)
-  } else if (realpathOrNull(target) === repoRoot) {
-    pass('dependencies["mind-dsh"] points at this checkout')
-  } else {
-    fail(`dependencies["mind-dsh"] points elsewhere: ${dependency} -> ${target ?? '(unresolvable)'}`)
-  }
+  fail(`dependencies["mind-dsh"] points elsewhere: ${dependency} -> ${localSpec ?? '(unresolvable)'}`)
 }
 
 const linkReal = realpathOrNull(linkPath)
 if (linkReal === null) {
   fail(`node_modules/mind-dsh is missing or a dangling link: ${linkPath}`)
-} else if (linkReal !== repoRoot) {
+} else if (localSpec !== null && linkReal !== repoRoot) {
   fail(`node_modules/mind-dsh resolves to ${linkReal}, expected ${repoRoot}`)
 } else {
-  pass('node_modules/mind-dsh resolves to this checkout')
+  pass(`node_modules/mind-dsh resolves to ${localSpec === null ? 'the installed package copy' : 'this checkout'}`)
 }
 
 if (linkReal !== null) {
   try {
     const installed = JSON.parse(fs.readFileSync(path.join(linkReal, 'package.json'), 'utf8'))
+    if (installed.name !== 'mind-dsh') {
+      fail(`installed package name is ${String(installed.name)}, expected mind-dsh`)
+    } else {
+      pass(`installed package is ${installed.name}@${String(installed.version)}`)
+    }
     const patch = installed?.dsh?.bundle?.patch
     if (typeof patch !== 'string') {
       fail('installed package declares no dsh.bundle.patch')
@@ -204,12 +207,14 @@ if (fix) {
   console.log('repairing…')
   let changed = false
 
-  if (realpathOrNull(linkPath) !== repoRoot) {
+  if (localSpec !== null && realpathOrNull(linkPath) !== repoRoot) {
     fs.mkdirSync(path.dirname(linkPath), { recursive: true })
     fs.rmSync(linkPath, { force: true })
     fs.symlinkSync(repoRoot, linkPath)
     console.log(`  fixed  relinked node_modules/mind-dsh -> ${repoRoot}`)
     changed = true
+  } else if (localSpec === null && realpathOrNull(linkPath) === null) {
+    console.log('  skip   node_modules/mind-dsh is missing; reinstall it from its package source')
   }
 
   if (Array.isArray(bundles) && !bundles.includes('mind-dsh')) {
