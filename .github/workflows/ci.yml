@@ -24,3 +24,6 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+      # lib/ is committed so GitHub installs need no build; a source change
+      # without a rebuilt lib would ship stale code.
+      - run: git diff --exit-code -- lib

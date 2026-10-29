@@ -148,6 +148,12 @@ if (linkReal !== null) {
     } else {
       pass(`dsh.bundle.patch is present: ${patch}`)
     }
+    const nestedHost = path.join(linkReal, 'node_modules', '@deepseek-ai')
+    if (fs.existsSync(nestedHost)) {
+      fail('installed copy carries its own @deepseek-ai packages under node_modules; they shadow the host versions (install a build that ships lib instead of running prepare)')
+    } else {
+      pass('installed copy carries no nested @deepseek-ai packages')
+    }
   } catch (error) {
     fail(`cannot read installed package manifest: ${error instanceof Error ? error.message : String(error)}`)
   }

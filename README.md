@@ -72,7 +72,7 @@ dsh plugin --profile web add /absolute/path/to/MIND-for-DSH
 
 ## 安装方式与运维
 
-日常安装用 **GitHub 包**：profile 里记的是 `github:Alex-Fleet/MIND-for-DSH#<commit>`，`node_modules/mind-dsh` 是一份拷贝，和仓库路径无关。装/卸别的插件、移动仓库、重启都不会影响它。更新时用插件管理器添加新 commit；它会询问是否允许 `prepare` 构建，允许后自动写 `allowBuilds`。不建议绕过插件管理器直接用裸 `pnpm add`。
+日常安装用 **GitHub 包**：profile 里记的是 `github:Alex-Fleet/MIND-for-DSH#<commit>`，`node_modules/mind-dsh` 是一份拷贝，和仓库路径无关。装/卸别的插件、移动仓库、重启都不会影响它。安装不需要构建（`lib/` 随仓库提交），也不会拉 devDependencies；更新时用插件管理器添加新 commit，不建议绕过插件管理器直接用裸 `pnpm add`。
 
 开发时用 `link:` 指向工作目录（改动即时生效）。这份安装会随仓库路径变化，移动仓库或装/卸插件后要跑一次自检。
 
@@ -93,3 +93,5 @@ npm run typecheck   # host + client
 npm test
 npm run build       # tsc + esbuild client bundle -> lib/
 ```
+
+`lib/` 随仓库提交：改完源码先 `npm run build` 再提交；CI 会重建并校验 `lib/` 与源码一致。
